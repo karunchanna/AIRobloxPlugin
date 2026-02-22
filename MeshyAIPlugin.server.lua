@@ -1,12 +1,280 @@
 --[[
-	UI - Creates and manages the Meshy AI Plugin GUI.
-	Provides a 3-step wizard: Generate -> Texture -> Remesh -> Publish
+	Meshy AI Asset Generator - Roblox Studio Plugin (Single File)
+
+	Drop this file into your Roblox Studio Plugins folder:
+	  Windows: %localappdata%/Roblox/Plugins/
+	  Mac: ~/Documents/Roblox/Plugins/
+
+	A 4-step workflow for generating 3D assets using Meshy's AI API:
+	  1. Generate Mesh (text prompt or image)
+	  2. Texture (text prompt or reference image)
+	  3. Remesh (reduce triangle count for Roblox's 20k limit)
+	  4. Publish to Workspace
+
+	Requires a Meshy API key from https://www.meshy.ai/api
 ]]
 
+local HttpService = game:GetService("HttpService")
+local Selection = game:GetService("Selection")
+local UserInputService = game:GetService("UserInputService")
+
+-- Compatibility: use task.wait if available, otherwise wait
+local taskWait = task and task.wait or wait
+
+------------------------------------------------------------------------
+-- OBJParser
+------------------------------------------------------------------------
+local OBJParser = {}
+
+local function parseFaceVertex(str: string): {v: number, vt: number?, vn: number?}
+	local parts = string.split(str, "/")
+	local result: any = {}
+	result.v = tonumber(parts[1])
+	if parts[2] and parts[2] ~= "" then
+		result.vt = tonumber(parts[2])
+	end
+	if parts[3] and parts[3] ~= "" then
+		result.vn = tonumber(parts[3])
+	end
+	return result
+end
+
+function OBJParser.parse(objText: string): any
+	local positions: {Vector3} = {}
+	local uvs: {Vector2} = {}
+	local normals: {Vector3} = {}
+	local faces = {}
+
+	for line in objText:gmatch("[^\r\n]+") do
+		line = line:match("^%s*(.-)%s*$")
+
+		if line == "" or line:sub(1, 1) == "#" then
+			-- skip
+		elseif line:sub(1, 2) == "v " then
+			local x, y, z = line:match("v%s+([%-%d%.e]+)%s+([%-%d%.e]+)%s+([%-%d%.e]+)")
+			if x then
+				table.insert(positions, Vector3.new(tonumber(x), tonumber(y), tonumber(z)))
+			end
+		elseif line:sub(1, 3) == "vt " then
+			local u, v = line:match("vt%s+([%-%d%.e]+)%s+([%-%d%.e]+)")
+			if u then
+				table.insert(uvs, Vector2.new(tonumber(u), tonumber(v)))
+			end
+		elseif line:sub(1, 3) == "vn " then
+			local x, y, z = line:match("vn%s+([%-%d%.e]+)%s+([%-%d%.e]+)%s+([%-%d%.e]+)")
+			if x then
+				table.insert(normals, Vector3.new(tonumber(x), tonumber(y), tonumber(z)))
+			end
+		elseif line:sub(1, 2) == "f " then
+			local faceVerts = {}
+			for vertStr in line:sub(3):gmatch("%S+") do
+				local vert = parseFaceVertex(vertStr)
+				if vert.v < 0 then vert.v = #positions + 1 + vert.v end
+				if vert.vt and vert.vt < 0 then vert.vt = #uvs + 1 + vert.vt end
+				if vert.vn and vert.vn < 0 then vert.vn = #normals + 1 + vert.vn end
+				table.insert(faceVerts, vert)
+			end
+			if #faceVerts >= 3 then
+				for i = 2, #faceVerts - 1 do
+					table.insert(faces, { faceVerts[1], faceVerts[i], faceVerts[i + 1] })
+				end
+			end
+		end
+	end
+
+	return { positions = positions, uvs = uvs, normals = normals, faces = faces }
+end
+
+function OBJParser.getBounds(meshData: any): (Vector3, Vector3, Vector3, Vector3)
+	local minX, minY, minZ = math.huge, math.huge, math.huge
+	local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
+	for _, pos in ipairs(meshData.positions) do
+		minX = math.min(minX, pos.X)
+		minY = math.min(minY, pos.Y)
+		minZ = math.min(minZ, pos.Z)
+		maxX = math.max(maxX, pos.X)
+		maxY = math.max(maxY, pos.Y)
+		maxZ = math.max(maxZ, pos.Z)
+	end
+	local min = Vector3.new(minX, minY, minZ)
+	local max = Vector3.new(maxX, maxY, maxZ)
+	return min, max, max - min, (min + max) / 2
+end
+
+------------------------------------------------------------------------
+-- MeshyAPI
+------------------------------------------------------------------------
+local MeshyAPI = {}
+MeshyAPI.__index = MeshyAPI
+
+local BASE_URL = "https://api.meshy.ai"
+
+local ENDPOINTS = {
+	["text-to-3d"] = "/openapi/v2/text-to-3d",
+	["image-to-3d"] = "/openapi/v1/image-to-3d",
+	["retexture"] = "/openapi/v1/retexture",
+	["remesh"] = "/openapi/v1/remesh",
+}
+
+function MeshyAPI.new()
+	local self = setmetatable({}, MeshyAPI)
+	self._apiKey = ""
+	return self
+end
+
+function MeshyAPI:setApiKey(key: string)
+	self._apiKey = key
+end
+
+function MeshyAPI:getApiKey(): string
+	return self._apiKey
+end
+
+function MeshyAPI:_request(method: string, path: string, body: any?): any
+	if self._apiKey == "" then
+		error("API key not set. Please enter your Meshy API key in Settings.")
+	end
+
+	local url = BASE_URL .. path
+	local headers = {
+		["Authorization"] = "Bearer " .. self._apiKey,
+		["Content-Type"] = "application/json",
+	}
+
+	local requestOptions: any = {
+		Url = url,
+		Method = method,
+		Headers = headers,
+	}
+
+	if body and method ~= "GET" then
+		requestOptions.Body = HttpService:JSONEncode(body)
+	end
+
+	local success, response = pcall(function()
+		return HttpService:RequestAsync(requestOptions)
+	end)
+
+	if not success then
+		error("HTTP request failed: " .. tostring(response))
+	end
+
+	if response.StatusCode < 200 or response.StatusCode >= 300 then
+		local errorMsg = "API error (" .. response.StatusCode .. ")"
+		pcall(function()
+			local decoded = HttpService:JSONDecode(response.Body)
+			if decoded.message then
+				errorMsg = errorMsg .. ": " .. decoded.message
+			end
+		end)
+		error(errorMsg)
+	end
+
+	return HttpService:JSONDecode(response.Body)
+end
+
+function MeshyAPI:textTo3DPreview(prompt: string, artStyle: string?): string
+	local body: any = {
+		mode = "preview",
+		prompt = prompt,
+		art_style = artStyle or "realistic",
+		should_remesh = false,
+	}
+	local result = self:_request("POST", ENDPOINTS["text-to-3d"], body)
+	return result.result
+end
+
+function MeshyAPI:textTo3DRefine(previewTaskId: string, texturePrompt: string?, textureImageUrl: string?): string
+	local body: any = {
+		mode = "refine",
+		preview_task_id = previewTaskId,
+		enable_pbr = true,
+	}
+	if textureImageUrl and textureImageUrl ~= "" then
+		body.texture_image_url = textureImageUrl
+	elseif texturePrompt and texturePrompt ~= "" then
+		body.texture_prompt = texturePrompt
+	end
+	local result = self:_request("POST", ENDPOINTS["text-to-3d"], body)
+	return result.result
+end
+
+function MeshyAPI:imageTo3D(imageUrl: string, shouldTexture: boolean?): string
+	local body: any = {
+		image_url = imageUrl,
+		should_texture = shouldTexture or false,
+		enable_pbr = true,
+	}
+	local result = self:_request("POST", ENDPOINTS["image-to-3d"], body)
+	return result.result
+end
+
+function MeshyAPI:retexture(inputTaskId: string, textStylePrompt: string?, imageStyleUrl: string?): string
+	local body: any = {
+		input_task_id = inputTaskId,
+		enable_pbr = true,
+	}
+	if imageStyleUrl and imageStyleUrl ~= "" then
+		body.image_style_url = imageStyleUrl
+	end
+	if textStylePrompt and textStylePrompt ~= "" then
+		body.text_style_prompt = textStylePrompt
+	end
+	local result = self:_request("POST", ENDPOINTS["retexture"], body)
+	return result.result
+end
+
+function MeshyAPI:remesh(inputTaskId: string, targetPolycount: number): string
+	local body = {
+		input_task_id = inputTaskId,
+		target_polycount = targetPolycount,
+		topology = "triangle",
+		target_formats = {"obj", "glb"},
+	}
+	local result = self:_request("POST", ENDPOINTS["remesh"], body)
+	return result.result
+end
+
+function MeshyAPI:getTask(taskType: string, taskId: string): any
+	local endpoint = ENDPOINTS[taskType]
+	if not endpoint then
+		error("Unknown task type: " .. taskType)
+	end
+	return self:_request("GET", endpoint .. "/" .. taskId)
+end
+
+function MeshyAPI:pollTask(taskType: string, taskId: string, onProgress: ((number) -> ())?): any
+	local POLL_INTERVAL = 3
+	local MAX_POLLS = 200
+
+	for _ = 1, MAX_POLLS do
+		local taskData = self:getTask(taskType, taskId)
+		local status = taskData.status
+
+		if onProgress and taskData.progress then
+			onProgress(taskData.progress)
+		end
+
+		if status == "SUCCEEDED" then
+			if onProgress then onProgress(100) end
+			return taskData
+		elseif status == "FAILED" or status == "CANCELED" then
+			local errMsg = taskData.task_error and taskData.task_error.message or "Unknown error"
+			error("Task " .. status:lower() .. ": " .. errMsg)
+		end
+
+		taskWait(POLL_INTERVAL)
+	end
+
+	error("Task timed out after polling " .. MAX_POLLS .. " times")
+end
+
+------------------------------------------------------------------------
+-- UI
+------------------------------------------------------------------------
 local UI = {}
 UI.__index = UI
 
--- Theme colors (dark, matching Roblox Studio)
 local Theme = {
 	bg = Color3.fromRGB(46, 46, 46),
 	panel = Color3.fromRGB(56, 56, 56),
@@ -38,9 +306,6 @@ local CORNER = UDim.new(0, 6)
 local FONT = Enum.Font.GothamMedium
 local FONT_BOLD = Enum.Font.GothamBold
 
-----------------------------------------------------------------------
--- Helper: create a UICorner
-----------------------------------------------------------------------
 local function addCorner(parent, radius)
 	local c = Instance.new("UICorner")
 	c.CornerRadius = radius or CORNER
@@ -48,9 +313,6 @@ local function addCorner(parent, radius)
 	return c
 end
 
-----------------------------------------------------------------------
--- Helper: create a UIStroke (border)
-----------------------------------------------------------------------
 local function addBorder(parent, color, thickness)
 	local s = Instance.new("UIStroke")
 	s.Color = color or Theme.inputBorder
@@ -60,9 +322,6 @@ local function addBorder(parent, color, thickness)
 	return s
 end
 
-----------------------------------------------------------------------
--- Helper: create a UIPadding
-----------------------------------------------------------------------
 local function addPadding(parent, t, b, l, r)
 	local p = Instance.new("UIPadding")
 	p.PaddingTop = UDim.new(0, t or PADDING)
@@ -73,9 +332,6 @@ local function addPadding(parent, t, b, l, r)
 	return p
 end
 
-----------------------------------------------------------------------
--- Helper: create a TextLabel
-----------------------------------------------------------------------
 local function createLabel(props)
 	local label = Instance.new("TextLabel")
 	label.Name = props.Name or "Label"
@@ -93,9 +349,6 @@ local function createLabel(props)
 	return label
 end
 
-----------------------------------------------------------------------
--- Helper: create a TextBox
-----------------------------------------------------------------------
 local function createInput(props)
 	local frame = Instance.new("Frame")
 	frame.Name = props.Name or "InputFrame"
@@ -126,9 +379,6 @@ local function createInput(props)
 	return frame, box
 end
 
-----------------------------------------------------------------------
--- Helper: create a button
-----------------------------------------------------------------------
 local function createButton(props)
 	local btn = Instance.new("TextButton")
 	btn.Name = props.Name or "Button"
@@ -142,13 +392,9 @@ local function createButton(props)
 	btn.LayoutOrder = props.LayoutOrder or 0
 	btn.Parent = props.Parent
 	addCorner(btn)
-
 	return btn
 end
 
-----------------------------------------------------------------------
--- Helper: create a section heading
-----------------------------------------------------------------------
 local function createSectionHeading(props)
 	local frame = Instance.new("Frame")
 	frame.Name = props.Name or "Section"
@@ -170,9 +416,6 @@ local function createSectionHeading(props)
 	return frame, label
 end
 
-----------------------------------------------------------------------
--- Helper: create a divider line
-----------------------------------------------------------------------
 local function createDivider(props)
 	local div = Instance.new("Frame")
 	div.Name = "Divider"
@@ -184,9 +427,6 @@ local function createDivider(props)
 	return div
 end
 
-----------------------------------------------------------------------
--- Helper: create a toggle button group (Text / Image)
-----------------------------------------------------------------------
 local function createToggle(props)
 	local frame = Instance.new("Frame")
 	frame.Name = props.Name or "Toggle"
@@ -248,9 +488,6 @@ local function createToggle(props)
 	return frame, function() return selected end, setSelected
 end
 
-----------------------------------------------------------------------
--- Helper: create a progress bar with status text
-----------------------------------------------------------------------
 local function createProgressBar(props)
 	local container = Instance.new("Frame")
 	container.Name = props.Name or "ProgressContainer"
@@ -260,7 +497,6 @@ local function createProgressBar(props)
 	container.Visible = false
 	container.Parent = props.Parent
 
-	-- Progress bar track
 	local track = Instance.new("Frame")
 	track.Name = "Track"
 	track.Size = UDim2.new(1, 0, 0, 6)
@@ -269,7 +505,6 @@ local function createProgressBar(props)
 	track.Parent = container
 	addCorner(track, UDim.new(0, 3))
 
-	-- Progress bar fill
 	local fill = Instance.new("Frame")
 	fill.Name = "Fill"
 	fill.Size = UDim2.new(0, 0, 1, 0)
@@ -277,7 +512,6 @@ local function createProgressBar(props)
 	fill.Parent = track
 	addCorner(fill, UDim.new(0, 3))
 
-	-- Status label
 	local status = Instance.new("TextLabel")
 	status.Name = "Status"
 	status.Size = UDim2.new(1, 0, 0, 18)
@@ -290,26 +524,16 @@ local function createProgressBar(props)
 	status.TextXAlignment = Enum.TextXAlignment.Left
 	status.Parent = container
 
-	-- Controller functions
 	local controller = {}
-
 	function controller:setProgress(percent: number)
 		fill.Size = UDim2.new(math.clamp(percent / 100, 0, 1), 0, 1, 0)
 	end
-
 	function controller:setStatus(text: string, color: Color3?)
 		status.Text = text
 		status.TextColor3 = color or Theme.textMuted
 	end
-
-	function controller:show()
-		container.Visible = true
-	end
-
-	function controller:hide()
-		container.Visible = false
-	end
-
+	function controller:show() container.Visible = true end
+	function controller:hide() container.Visible = false end
 	function controller:reset()
 		fill.Size = UDim2.new(0, 0, 1, 0)
 		status.Text = ""
@@ -319,9 +543,6 @@ local function createProgressBar(props)
 	return container, controller
 end
 
-----------------------------------------------------------------------
--- Helper: create a slider (1000 - 20000)
-----------------------------------------------------------------------
 local function createSlider(props)
 	local minVal = props.Min or 1000
 	local maxVal = props.Max or 20000
@@ -335,7 +556,6 @@ local function createSlider(props)
 	container.LayoutOrder = props.LayoutOrder or 0
 	container.Parent = props.Parent
 
-	-- Value label
 	local valueLabel = Instance.new("TextLabel")
 	valueLabel.Name = "Value"
 	valueLabel.Size = UDim2.new(1, 0, 0, 18)
@@ -347,7 +567,6 @@ local function createSlider(props)
 	valueLabel.TextXAlignment = Enum.TextXAlignment.Left
 	valueLabel.Parent = container
 
-	-- Track
 	local track = Instance.new("Frame")
 	track.Name = "Track"
 	track.Size = UDim2.new(1, -20, 0, 8)
@@ -356,7 +575,6 @@ local function createSlider(props)
 	track.Parent = container
 	addCorner(track, UDim.new(0, 4))
 
-	-- Fill
 	local fillFraction = (defaultVal - minVal) / (maxVal - minVal)
 	local fill = Instance.new("Frame")
 	fill.Name = "Fill"
@@ -365,7 +583,6 @@ local function createSlider(props)
 	fill.Parent = track
 	addCorner(fill, UDim.new(0, 4))
 
-	-- Thumb
 	local thumb = Instance.new("TextButton")
 	thumb.Name = "Thumb"
 	thumb.Size = UDim2.new(0, 16, 0, 16)
@@ -377,7 +594,6 @@ local function createSlider(props)
 	thumb.Parent = track
 	addCorner(thumb, UDim.new(0.5, 0))
 
-	-- Min/Max labels
 	local minLabel = Instance.new("TextLabel")
 	minLabel.Size = UDim2.new(0.5, 0, 0, 16)
 	minLabel.Position = UDim2.new(0, 0, 0, 36)
@@ -400,86 +616,55 @@ local function createSlider(props)
 	maxLabel.TextXAlignment = Enum.TextXAlignment.Right
 	maxLabel.Parent = container
 
-	-- State
 	local currentValue = defaultVal
 	local dragging = false
-
-	local UserInputService = game:GetService("UserInputService")
 
 	local function updateValue(fraction)
 		fraction = math.clamp(fraction, 0, 1)
 		local raw = minVal + fraction * (maxVal - minVal)
 		currentValue = math.floor(raw / step + 0.5) * step
 		currentValue = math.clamp(currentValue, minVal, maxVal)
-
 		local displayFraction = (currentValue - minVal) / (maxVal - minVal)
 		fill.Size = UDim2.new(displayFraction, 0, 1, 0)
 		thumb.Position = UDim2.new(displayFraction, -8, 0.5, -8)
 		valueLabel.Text = "Triangle Count: " .. tostring(currentValue)
-
-		if props.OnChanged then
-			props.OnChanged(currentValue)
-		end
+		if props.OnChanged then props.OnChanged(currentValue) end
 	end
 
 	thumb.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			dragging = true
-		end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = true end
 	end)
-
 	thumb.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			dragging = false
-		end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
 	end)
-
-	-- Also allow clicking on the track to jump
 	track.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
 			dragging = true
-			local fraction = (input.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X
-			updateValue(fraction)
+			updateValue((input.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X)
 		end
 	end)
-
 	track.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			dragging = false
-		end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
 	end)
-
 	UserInputService.InputChanged:Connect(function(input)
 		if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
-			local fraction = (input.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X
-			updateValue(fraction)
+			updateValue((input.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X)
 		end
 	end)
-
 	UserInputService.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			dragging = false
-		end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
 	end)
 
-	-- Controller
 	local controller = {}
-
-	function controller:getValue()
-		return currentValue
-	end
-
+	function controller:getValue() return currentValue end
 	function controller:setValue(val)
-		local fraction = (val - minVal) / (maxVal - minVal)
-		updateValue(fraction)
+		updateValue((val - minVal) / (maxVal - minVal))
 	end
 
 	return container, controller
 end
 
-----------------------------------------------------------------------
--- Main UI builder
-----------------------------------------------------------------------
+-- UI constructor
 function UI.new(widget: DockWidgetPluginGui)
 	local self = setmetatable({}, UI)
 	self.widget = widget
@@ -491,7 +676,6 @@ end
 function UI:_build()
 	local widget = self.widget
 
-	-- Root scroll frame
 	local scroll = Instance.new("ScrollingFrame")
 	scroll.Name = "Root"
 	scroll.Size = UDim2.new(1, 0, 1, 0)
@@ -516,9 +700,7 @@ function UI:_build()
 		return order
 	end
 
-	--------------------------------------------------------------------
 	-- Title
-	--------------------------------------------------------------------
 	createLabel({
 		Name = "Title",
 		Text = "Meshy AI Asset Generator",
@@ -533,9 +715,7 @@ function UI:_build()
 
 	createDivider({ LayoutOrder = nextOrder(), Parent = scroll })
 
-	--------------------------------------------------------------------
 	-- Settings: API Key
-	--------------------------------------------------------------------
 	createSectionHeading({
 		Name = "SettingsHeader",
 		Text = "Settings",
@@ -553,7 +733,6 @@ function UI:_build()
 		Parent = scroll,
 	})
 
-	-- API key row: input + save button
 	local apiKeyRow = Instance.new("Frame")
 	apiKeyRow.Name = "ApiKeyRow"
 	apiKeyRow.Size = UDim2.new(1, 0, 0, 32)
@@ -601,9 +780,7 @@ function UI:_build()
 
 	createDivider({ LayoutOrder = nextOrder(), Parent = scroll })
 
-	--------------------------------------------------------------------
 	-- Step 1: Generate Mesh
-	--------------------------------------------------------------------
 	createSectionHeading({
 		Name = "Step1Header",
 		Text = "Step 1: Generate Mesh",
@@ -633,7 +810,6 @@ function UI:_build()
 	})
 	self._getGenInputType = getGenInputType
 
-	-- Text prompt input
 	local genPromptFrame, genPromptInput = createInput({
 		Name = "GenPrompt",
 		Placeholder = "Describe the 3D object (e.g., a medieval wooden chair)",
@@ -646,7 +822,6 @@ function UI:_build()
 	self._genPromptFrame = genPromptFrame
 	self._genPromptInput = genPromptInput
 
-	-- Image URL input (hidden by default)
 	local genImageFrame, genImageInput = createInput({
 		Name = "GenImageUrl",
 		Placeholder = "Paste image URL (https://... or data:image/...)",
@@ -657,7 +832,6 @@ function UI:_build()
 	self._genImageFrame = genImageFrame
 	self._genImageInput = genImageInput
 
-	-- Art style label and toggle (only for text)
 	createLabel({
 		Name = "ArtStyleLabel",
 		Text = "Art Style",
@@ -695,9 +869,7 @@ function UI:_build()
 		btn.Text = style:sub(1, 1):upper() .. style:sub(2)
 		btn.Parent = artStyleFrame
 		addCorner(btn)
-
 		artStyleButtons[style] = btn
-
 		btn.Activated:Connect(function()
 			self._selectedArtStyle = style
 			for s, b in pairs(artStyleButtons) do
@@ -713,7 +885,6 @@ function UI:_build()
 	end
 	self._artStyleFrame = artStyleFrame
 
-	-- Generate button
 	local genBtn = createButton({
 		Name = "GenerateBtn",
 		Text = "Generate Mesh",
@@ -729,7 +900,6 @@ function UI:_build()
 	end)
 	self._genBtn = genBtn
 
-	-- Generate progress
 	local _, genProgress = createProgressBar({
 		Name = "GenProgress",
 		LayoutOrder = nextOrder(),
@@ -737,7 +907,6 @@ function UI:_build()
 	})
 	self._genProgress = genProgress
 
-	-- Thumbnail preview
 	local thumbnail = Instance.new("ImageLabel")
 	thumbnail.Name = "Thumbnail"
 	thumbnail.Size = UDim2.new(1, 0, 0, 180)
@@ -752,9 +921,7 @@ function UI:_build()
 
 	createDivider({ LayoutOrder = nextOrder(), Parent = scroll })
 
-	--------------------------------------------------------------------
 	-- Step 2: Texture (Optional)
-	--------------------------------------------------------------------
 	local step2Container = Instance.new("Frame")
 	step2Container.Name = "Step2"
 	step2Container.Size = UDim2.new(1, 0, 0, 0)
@@ -850,9 +1017,7 @@ function UI:_build()
 
 	createDivider({ LayoutOrder = nextOrder(), Parent = scroll })
 
-	--------------------------------------------------------------------
 	-- Step 3: Remesh (Optional)
-	--------------------------------------------------------------------
 	local step3Container = Instance.new("Frame")
 	step3Container.Name = "Step3"
 	step3Container.Size = UDim2.new(1, 0, 0, 0)
@@ -923,9 +1088,7 @@ function UI:_build()
 
 	createDivider({ LayoutOrder = nextOrder(), Parent = scroll })
 
-	--------------------------------------------------------------------
 	-- Publish to Workspace
-	--------------------------------------------------------------------
 	local publishContainer = Instance.new("Frame")
 	publishContainer.Name = "Publish"
 	publishContainer.Size = UDim2.new(1, 0, 0, 0)
@@ -974,7 +1137,6 @@ function UI:_build()
 	})
 	self._publishProgress = publishProgress
 
-	-- Download links label (shown as fallback)
 	local downloadLabel = createLabel({
 		Name = "DownloadLinks",
 		Text = "",
@@ -989,7 +1151,6 @@ function UI:_build()
 	downloadLabel.Visible = false
 	self._downloadLabel = downloadLabel
 
-	-- Spacer at bottom
 	local spacer = Instance.new("Frame")
 	spacer.Name = "Spacer"
 	spacer.Size = UDim2.new(1, 0, 0, 20)
@@ -997,21 +1158,17 @@ function UI:_build()
 	spacer.LayoutOrder = nextOrder()
 	spacer.Parent = scroll
 
-	-- Initial state: steps 2-4 disabled
 	self:_setStepEnabled(2, false)
 	self:_setStepEnabled(3, false)
 	self:_setPublishEnabled(false)
 end
 
-----------------------------------------------------------------------
--- Input visibility toggles
-----------------------------------------------------------------------
 function UI:_updateGenInputVisibility(option: string)
-	if option == "A" then -- Text
+	if option == "A" then
 		self._genPromptFrame.Visible = true
 		self._genImageFrame.Visible = false
 		self._artStyleFrame.Visible = true
-	else -- Image
+	else
 		self._genPromptFrame.Visible = false
 		self._genImageFrame.Visible = true
 		self._artStyleFrame.Visible = false
@@ -1019,27 +1176,20 @@ function UI:_updateGenInputVisibility(option: string)
 end
 
 function UI:_updateTexInputVisibility(option: string)
-	if option == "A" then -- Text
+	if option == "A" then
 		self._texPromptFrame.Visible = true
 		self._texImageFrame.Visible = false
-	else -- Image
+	else
 		self._texPromptFrame.Visible = false
 		self._texImageFrame.Visible = true
 	end
 end
 
-----------------------------------------------------------------------
--- Enable/disable steps
-----------------------------------------------------------------------
 function UI:_setStepEnabled(step: number, enabled: boolean)
 	local container
-	if step == 2 then
-		container = self._step2
-	elseif step == 3 then
-		container = self._step3
-	end
+	if step == 2 then container = self._step2
+	elseif step == 3 then container = self._step3 end
 	if not container then return end
-
 	container.Visible = enabled
 end
 
@@ -1047,28 +1197,11 @@ function UI:_setPublishEnabled(enabled: boolean)
 	self._publishContainer.Visible = enabled
 end
 
-----------------------------------------------------------------------
--- Public API
-----------------------------------------------------------------------
-function UI:setApiKey(key: string)
-	self._apiKeyInput.Text = key
-end
-
-function UI:enableStep(step: number)
-	self:_setStepEnabled(step, true)
-end
-
-function UI:disableStep(step: number)
-	self:_setStepEnabled(step, false)
-end
-
-function UI:enablePublish()
-	self:_setPublishEnabled(true)
-end
-
-function UI:disablePublish()
-	self:_setPublishEnabled(false)
-end
+function UI:setApiKey(key: string) self._apiKeyInput.Text = key end
+function UI:enableStep(step: number) self:_setStepEnabled(step, true) end
+function UI:disableStep(step: number) self:_setStepEnabled(step, false) end
+function UI:enablePublish() self:_setPublishEnabled(true) end
+function UI:disablePublish() self:_setPublishEnabled(false) end
 
 function UI:setThumbnail(url: string)
 	if url and url ~= "" then
@@ -1084,7 +1217,6 @@ function UI:setDownloadLinks(text: string)
 	self._downloadLabel.Visible = text ~= ""
 end
 
--- Progress helpers for each step
 function UI:showGenProgress()     self._genProgress:show() end
 function UI:hideGenProgress()     self._genProgress:hide() end
 function UI:setGenProgress(pct)   self._genProgress:setProgress(pct) end
@@ -1109,16 +1241,13 @@ function UI:setPubProgress(pct)   self._publishProgress:setProgress(pct) end
 function UI:setPubStatus(t, c)    self._publishProgress:setStatus(t, c) end
 function UI:resetPubProgress()    self._publishProgress:reset() end
 
--- Button enable/disable
 function UI:setButtonEnabled(btn, enabled)
 	local button
 	if btn == "generate" then button = self._genBtn
 	elseif btn == "texture" then button = self._texBtn
 	elseif btn == "remesh" then button = self._remeshBtn
-	elseif btn == "publish" then button = self._publishBtn
-	end
+	elseif btn == "publish" then button = self._publishBtn end
 	if not button then return end
-
 	button.AutoButtonColor = enabled
 	if enabled then
 		button.BackgroundColor3 = btn == "publish" and Theme.success or Theme.primary
@@ -1129,4 +1258,436 @@ function UI:setButtonEnabled(btn, enabled)
 	end
 end
 
-return UI
+------------------------------------------------------------------------
+-- Plugin Setup
+------------------------------------------------------------------------
+local toolbar = plugin:CreateToolbar("Meshy AI")
+local toggleButton = toolbar:CreateButton(
+	"Asset Generator",
+	"Generate 3D assets with Meshy AI",
+	"rbxassetid://14978048121"
+)
+
+local widgetInfo = DockWidgetPluginGuiInfo.new(
+	Enum.InitialDockState.Right,
+	false, false,
+	320, 700,
+	280, 400
+)
+
+local widget = plugin:CreateDockWidgetPluginGui("MeshyAIAssetGenerator", widgetInfo)
+widget.Title = "Meshy AI"
+
+local api = MeshyAPI.new()
+local ui = UI.new(widget)
+
+------------------------------------------------------------------------
+-- State
+------------------------------------------------------------------------
+local state = {
+	currentTaskId = nil,
+	currentTaskType = nil,
+	sourceType = nil,
+	modelUrls = nil,
+	textureUrls = nil,
+	thumbnailUrl = nil,
+	busy = false,
+}
+
+------------------------------------------------------------------------
+-- Persistence: load/save API key
+------------------------------------------------------------------------
+local function loadApiKey()
+	local key = plugin:GetSetting("MeshyApiKey")
+	if key and key ~= "" then
+		api:setApiKey(key)
+		ui:setApiKey(key)
+	end
+end
+
+local function saveApiKey(key)
+	plugin:SetSetting("MeshyApiKey", key)
+	api:setApiKey(key)
+end
+
+loadApiKey()
+
+------------------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------------------
+local function setBusy(busy)
+	state.busy = busy
+	ui:setButtonEnabled("generate", not busy)
+	ui:setButtonEnabled("texture", not busy)
+	ui:setButtonEnabled("remesh", not busy)
+	ui:setButtonEnabled("publish", not busy)
+end
+
+local function downloadText(url: string): string
+	local response = HttpService:RequestAsync({
+		Url = url,
+		Method = "GET",
+	})
+	if response.StatusCode ~= 200 then
+		error("Download failed (HTTP " .. response.StatusCode .. ")")
+	end
+	return response.Body
+end
+
+------------------------------------------------------------------------
+-- Mesh Import: OBJ -> EditableMesh -> MeshPart
+------------------------------------------------------------------------
+local function createMeshPartFromOBJ(objText: string): MeshPart
+	local meshData = OBJParser.parse(objText)
+
+	if #meshData.positions == 0 or #meshData.faces == 0 then
+		error("OBJ file contains no geometry")
+	end
+
+	local editableMesh = Instance.new("EditableMesh")
+
+	local vertexMap = {}
+	local function getOrCreateVertex(posIdx, uvIdx, normalIdx)
+		local key = tostring(posIdx) .. "/" .. tostring(uvIdx or "") .. "/" .. tostring(normalIdx or "")
+		if vertexMap[key] then return vertexMap[key] end
+
+		local pos = meshData.positions[posIdx]
+		if not pos then error("Invalid vertex index: " .. tostring(posIdx)) end
+
+		local vid = editableMesh:AddVertex(pos)
+
+		if normalIdx and meshData.normals[normalIdx] then
+			editableMesh:SetVertexNormal(vid, meshData.normals[normalIdx])
+		end
+
+		if uvIdx and meshData.uvs[uvIdx] then
+			local uv = meshData.uvs[uvIdx]
+			editableMesh:SetUV(vid, Vector2.new(uv.X, 1 - uv.Y))
+		end
+
+		vertexMap[key] = vid
+		return vid
+	end
+
+	local triCount = 0
+	for _, face in ipairs(meshData.faces) do
+		local v1 = getOrCreateVertex(face[1].v, face[1].vt, face[1].vn)
+		local v2 = getOrCreateVertex(face[2].v, face[2].vt, face[2].vn)
+		local v3 = getOrCreateVertex(face[3].v, face[3].vt, face[3].vn)
+
+		local success = pcall(function()
+			editableMesh:AddTriangle(v1, v2, v3)
+		end)
+		if success then triCount = triCount + 1 end
+	end
+
+	if triCount == 0 then
+		editableMesh:Destroy()
+		error("Failed to create any triangles from OBJ data")
+	end
+
+	local _, _, size, center = OBJParser.getBounds(meshData)
+	local meshSize = Vector3.new(
+		math.max(size.X, 0.1),
+		math.max(size.Y, 0.1),
+		math.max(size.Z, 0.1)
+	)
+
+	local meshPart = Instance.new("MeshPart")
+	meshPart.Name = "MeshyAsset"
+	meshPart.Size = meshSize
+	meshPart.Anchored = true
+	meshPart.Position = Vector3.new(0, meshSize.Y / 2, 0)
+
+	editableMesh.Parent = meshPart
+
+	return meshPart, triCount
+end
+
+------------------------------------------------------------------------
+-- Callbacks
+------------------------------------------------------------------------
+
+ui.callbacks.onApiKeySaved = function(key)
+	if key == "" then
+		ui:showGenProgress()
+		ui:setGenStatus("Please enter a valid API key.", Color3.fromRGB(244, 67, 54))
+		return
+	end
+	saveApiKey(key)
+	ui:showGenProgress()
+	ui:setGenStatus("API key saved!", Color3.fromRGB(76, 175, 80))
+	task.delay(2, function()
+		ui:resetGenProgress()
+	end)
+end
+
+-- Step 1: Generate Mesh
+ui.callbacks.onGenerate = function(inputType, prompt, artStyle)
+	if state.busy then return end
+	if prompt == "" then
+		ui:showGenProgress()
+		ui:setGenStatus("Please enter a prompt or image URL.", Color3.fromRGB(244, 67, 54))
+		return
+	end
+
+	setBusy(true)
+	ui:showGenProgress()
+	ui:setGenProgress(0)
+	ui:setGenStatus("Creating task...")
+	ui:setThumbnail("")
+
+	ui:disableStep(2)
+	ui:disableStep(3)
+	ui:disablePublish()
+	ui:resetTexProgress()
+	ui:resetRemeshProgress()
+	ui:resetPubProgress()
+
+	task.spawn(function()
+		local success, err = pcall(function()
+			local taskId, taskType
+
+			if inputType == "text" then
+				taskType = "text-to-3d"
+				ui:setGenStatus("Submitting text-to-3D preview...")
+				taskId = api:textTo3DPreview(prompt, artStyle)
+			else
+				taskType = "image-to-3d"
+				ui:setGenStatus("Submitting image-to-3D task...")
+				taskId = api:imageTo3D(prompt, false)
+			end
+
+			ui:setGenStatus("Generating mesh... (this may take a few moments)")
+
+			local result = api:pollTask(taskType, taskId, function(progress)
+				ui:setGenProgress(progress)
+				ui:setGenStatus("Generating mesh... " .. tostring(progress) .. "%")
+			end)
+
+			state.currentTaskId = taskId
+			state.currentTaskType = taskType
+			state.sourceType = taskType
+			state.modelUrls = result.model_urls
+			state.textureUrls = result.texture_urls
+			state.thumbnailUrl = result.thumbnail_url
+
+			ui:setGenProgress(100)
+			ui:setGenStatus("Mesh generated!", Color3.fromRGB(76, 175, 80))
+			ui:setThumbnail(result.thumbnail_url or "")
+			ui:enableStep(2)
+			ui:enableStep(3)
+			ui:enablePublish()
+		end)
+
+		if not success then
+			ui:setGenProgress(0)
+			ui:setGenStatus("Error: " .. tostring(err), Color3.fromRGB(244, 67, 54))
+		end
+
+		setBusy(false)
+	end)
+end
+
+-- Step 2: Texture
+ui.callbacks.onTexture = function(inputType, prompt)
+	if state.busy then return end
+	if not state.currentTaskId then
+		ui:showTexProgress()
+		ui:setTexStatus("Generate a mesh first (Step 1).", Color3.fromRGB(244, 67, 54))
+		return
+	end
+	if prompt == "" then
+		ui:showTexProgress()
+		ui:setTexStatus("Please enter a texture prompt or image URL.", Color3.fromRGB(244, 67, 54))
+		return
+	end
+
+	setBusy(true)
+	ui:showTexProgress()
+	ui:setTexProgress(0)
+	ui:setTexStatus("Creating texture task...")
+
+	task.spawn(function()
+		local success, err = pcall(function()
+			local taskId, taskType
+
+			if state.sourceType == "text-to-3d" then
+				taskType = "text-to-3d"
+				local texturePrompt = inputType == "text" and prompt or nil
+				local textureImageUrl = inputType == "image" and prompt or nil
+
+				ui:setTexStatus("Submitting texture refine task...")
+				taskId = api:textTo3DRefine(state.currentTaskId, texturePrompt, textureImageUrl)
+			else
+				taskType = "retexture"
+				local textStylePrompt = inputType == "text" and prompt or nil
+				local imageStyleUrl = inputType == "image" and prompt or nil
+
+				ui:setTexStatus("Submitting retexture task...")
+				taskId = api:retexture(state.currentTaskId, textStylePrompt, imageStyleUrl)
+			end
+
+			ui:setTexStatus("Applying texture...")
+
+			local result = api:pollTask(taskType, taskId, function(progress)
+				ui:setTexProgress(progress)
+				ui:setTexStatus("Applying texture... " .. tostring(progress) .. "%")
+			end)
+
+			state.currentTaskId = taskId
+			state.currentTaskType = taskType
+			state.modelUrls = result.model_urls
+			state.textureUrls = result.texture_urls
+			if result.thumbnail_url then
+				state.thumbnailUrl = result.thumbnail_url
+				ui:setThumbnail(result.thumbnail_url)
+			end
+
+			ui:setTexProgress(100)
+			ui:setTexStatus("Texture applied!", Color3.fromRGB(76, 175, 80))
+		end)
+
+		if not success then
+			ui:setTexProgress(0)
+			ui:setTexStatus("Error: " .. tostring(err), Color3.fromRGB(244, 67, 54))
+		end
+
+		setBusy(false)
+	end)
+end
+
+-- Step 3: Remesh
+ui.callbacks.onRemesh = function(targetPolycount)
+	if state.busy then return end
+	if not state.currentTaskId then
+		ui:showRemeshProgress()
+		ui:setRemeshStatus("Generate a mesh first (Step 1).", Color3.fromRGB(244, 67, 54))
+		return
+	end
+
+	setBusy(true)
+	ui:showRemeshProgress()
+	ui:setRemeshProgress(0)
+	ui:setRemeshStatus("Creating remesh task...")
+
+	task.spawn(function()
+		local success, err = pcall(function()
+			ui:setRemeshStatus("Submitting remesh task (target: " .. tostring(targetPolycount) .. " tris)...")
+			local taskId = api:remesh(state.currentTaskId, targetPolycount)
+
+			ui:setRemeshStatus("Remeshing...")
+
+			local result = api:pollTask("remesh", taskId, function(progress)
+				ui:setRemeshProgress(progress)
+				ui:setRemeshStatus("Remeshing... " .. tostring(progress) .. "%")
+			end)
+
+			state.currentTaskId = taskId
+			state.currentTaskType = "remesh"
+			state.modelUrls = result.model_urls
+			if result.texture_urls then
+				state.textureUrls = result.texture_urls
+			end
+			if result.thumbnail_url then
+				state.thumbnailUrl = result.thumbnail_url
+				ui:setThumbnail(result.thumbnail_url)
+			end
+
+			ui:setRemeshProgress(100)
+			ui:setRemeshStatus("Remesh complete!", Color3.fromRGB(76, 175, 80))
+		end)
+
+		if not success then
+			ui:setRemeshProgress(0)
+			ui:setRemeshStatus("Error: " .. tostring(err), Color3.fromRGB(244, 67, 54))
+		end
+
+		setBusy(false)
+	end)
+end
+
+-- Step 4: Publish to Workspace
+ui.callbacks.onPublish = function()
+	if state.busy then return end
+	if not state.modelUrls then
+		ui:showPubProgress()
+		ui:setPubStatus("No model available. Run Generate first.", Color3.fromRGB(244, 67, 54))
+		return
+	end
+
+	setBusy(true)
+	ui:showPubProgress()
+	ui:setPubProgress(0)
+	ui:setPubStatus("Preparing to import...")
+
+	task.spawn(function()
+		local autoImportSuccess, autoImportErr = pcall(function()
+			local objUrl = state.modelUrls.obj
+			if not objUrl or objUrl == "" then
+				local glbUrl = state.modelUrls.glb
+				if not glbUrl then
+					error("No downloadable model URL found")
+				end
+				error("OBJ format not available; only GLB. Use manual download.")
+			end
+
+			ui:setPubProgress(20)
+			ui:setPubStatus("Downloading OBJ mesh data...")
+
+			local objText = downloadText(objUrl)
+
+			ui:setPubProgress(50)
+			ui:setPubStatus("Parsing mesh geometry...")
+
+			local meshPart, triCount = createMeshPartFromOBJ(objText)
+
+			ui:setPubProgress(80)
+			ui:setPubStatus("Adding to workspace (" .. tostring(triCount) .. " triangles)...")
+
+			local camera = workspace.CurrentCamera
+			if camera then
+				meshPart.Position = camera.CFrame.Position + camera.CFrame.LookVector * 15
+			end
+
+			meshPart.Parent = workspace
+			Selection:Set({meshPart})
+
+			ui:setPubProgress(100)
+			ui:setPubStatus("Added to workspace! (" .. tostring(triCount) .. " tris)", Color3.fromRGB(76, 175, 80))
+		end)
+
+		if not autoImportSuccess then
+			local links = "Auto-import unavailable: " .. tostring(autoImportErr) .. "\n\nDownload your model manually:"
+			if state.modelUrls then
+				if state.modelUrls.glb then links = links .. "\nGLB: " .. state.modelUrls.glb end
+				if state.modelUrls.fbx then links = links .. "\nFBX: " .. state.modelUrls.fbx end
+				if state.modelUrls.obj then links = links .. "\nOBJ: " .. state.modelUrls.obj end
+			end
+
+			ui:setPubProgress(0)
+			ui:setPubStatus("Auto-import failed. See download links below.", Color3.fromRGB(255, 152, 0))
+			ui:setDownloadLinks(links)
+
+			print("[Meshy AI] Model download links:")
+			if state.modelUrls.glb then print("  GLB: " .. state.modelUrls.glb) end
+			if state.modelUrls.fbx then print("  FBX: " .. state.modelUrls.fbx) end
+			if state.modelUrls.obj then print("  OBJ: " .. state.modelUrls.obj) end
+		end
+
+		setBusy(false)
+	end)
+end
+
+------------------------------------------------------------------------
+-- Toggle widget visibility
+------------------------------------------------------------------------
+toggleButton.Click:Connect(function()
+	widget.Enabled = not widget.Enabled
+end)
+
+widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+	toggleButton:SetActive(widget.Enabled)
+end)
+
+print("[Meshy AI] Plugin loaded. Click the toolbar button to open.")

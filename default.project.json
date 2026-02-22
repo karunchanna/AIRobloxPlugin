@@ -1,7 +1,0 @@
-{
-  "name": "MeshyAIPlugin",
-  "tree": {
-    "$className": "Script",
-    "$path": "src"
-  }
-}
