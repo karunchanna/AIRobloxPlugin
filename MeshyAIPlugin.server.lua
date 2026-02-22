@@ -17,6 +17,7 @@
 local HttpService = game:GetService("HttpService")
 local Selection = game:GetService("Selection")
 local UserInputService = game:GetService("UserInputService")
+local AssetService = game:GetService("AssetService")
 
 -- Compatibility: use task.wait if available, otherwise wait
 local taskWait = task and task.wait or wait
@@ -1111,14 +1112,14 @@ function UI:_build()
 
 	createSectionHeading({
 		Name = "PublishHeader",
-		Text = "Publish to Workspace",
+		Text = "Publish Asset",
 		LayoutOrder = nextPubOrder(),
 		Parent = publishContainer,
 	})
 
 	local publishBtn = createButton({
 		Name = "PublishBtn",
-		Text = "Add to Workspace",
+		Text = "Publish as Roblox Asset",
 		Color = Theme.success,
 		LayoutOrder = nextPubOrder(),
 		Parent = publishContainer,
@@ -1292,6 +1293,9 @@ local state = {
 	textureUrls = nil,
 	thumbnailUrl = nil,
 	busy = false,
+	-- Preview mesh (shown in workspace after generation)
+	previewMeshPart = nil,
+	previewEditableMesh = nil,
 }
 
 ------------------------------------------------------------------------
@@ -1337,14 +1341,18 @@ end
 ------------------------------------------------------------------------
 -- Mesh Import: OBJ -> EditableMesh -> MeshPart
 ------------------------------------------------------------------------
-local function createMeshPartFromOBJ(objText: string): MeshPart
+local function createMeshFromOBJ(objText: string)
 	local meshData = OBJParser.parse(objText)
 
 	if #meshData.positions == 0 or #meshData.faces == 0 then
 		error("OBJ file contains no geometry")
 	end
 
-	local editableMesh = Instance.new("EditableMesh")
+	-- Use AssetService:CreateEditableMesh() (Instance.new("EditableMesh") was removed)
+	local editableMesh = AssetService:CreateEditableMesh()
+	if not editableMesh then
+		error("Failed to create EditableMesh (memory budget may be exhausted)")
+	end
 
 	local vertexMap = {}
 	local function getOrCreateVertex(posIdx, uvIdx, normalIdx)
@@ -1375,10 +1383,10 @@ local function createMeshPartFromOBJ(objText: string): MeshPart
 		local v2 = getOrCreateVertex(face[2].v, face[2].vt, face[2].vn)
 		local v3 = getOrCreateVertex(face[3].v, face[3].vt, face[3].vn)
 
-		local success = pcall(function()
+		local ok = pcall(function()
 			editableMesh:AddTriangle(v1, v2, v3)
 		end)
-		if success then triCount = triCount + 1 end
+		if ok then triCount = triCount + 1 end
 	end
 
 	if triCount == 0 then
@@ -1386,22 +1394,46 @@ local function createMeshPartFromOBJ(objText: string): MeshPart
 		error("Failed to create any triangles from OBJ data")
 	end
 
-	local _, _, size, center = OBJParser.getBounds(meshData)
-	local meshSize = Vector3.new(
-		math.max(size.X, 0.1),
-		math.max(size.Y, 0.1),
-		math.max(size.Z, 0.1)
-	)
-
-	local meshPart = Instance.new("MeshPart")
+	-- Create a MeshPart from the EditableMesh via AssetService
+	local meshPart = AssetService:CreateMeshPartAsync(Content.fromObject(editableMesh))
 	meshPart.Name = "MeshyAsset"
-	meshPart.Size = meshSize
 	meshPart.Anchored = true
-	meshPart.Position = Vector3.new(0, meshSize.Y / 2, 0)
 
-	editableMesh.Parent = meshPart
+	return meshPart, editableMesh, triCount
+end
 
-	return meshPart, triCount
+-- Import preview mesh into workspace, removing any previous preview
+local function importPreview(modelUrls)
+	local objUrl = modelUrls and modelUrls.obj
+	if not objUrl or objUrl == "" then
+		return -- no OBJ available, skip preview
+	end
+
+	-- Remove old preview
+	if state.previewMeshPart and state.previewMeshPart.Parent then
+		state.previewMeshPart:Destroy()
+	end
+	if state.previewEditableMesh then
+		pcall(function() state.previewEditableMesh:Destroy() end)
+	end
+
+	local objText = downloadText(objUrl)
+	local meshPart, editableMesh, triCount = createMeshFromOBJ(objText)
+
+	-- Position in front of camera
+	local camera = workspace.CurrentCamera
+	if camera then
+		meshPart.Position = camera.CFrame.Position + camera.CFrame.LookVector * 15
+	end
+
+	meshPart.Parent = workspace
+	Selection:Set({meshPart})
+
+	-- Store for later publish
+	state.previewMeshPart = meshPart
+	state.previewEditableMesh = editableMesh
+
+	return triCount
 end
 
 ------------------------------------------------------------------------
@@ -1472,8 +1504,22 @@ ui.callbacks.onGenerate = function(inputType, prompt, artStyle)
 			state.textureUrls = result.texture_urls
 			state.thumbnailUrl = result.thumbnail_url
 
-			ui:setGenProgress(100)
-			ui:setGenStatus("Mesh generated!", Color3.fromRGB(76, 175, 80))
+			ui:setGenProgress(80)
+			ui:setGenStatus("Importing preview into workspace...")
+
+			-- Auto-import preview mesh
+			local previewOk, previewResult = pcall(importPreview, result.model_urls)
+			if previewOk and previewResult then
+				ui:setGenProgress(100)
+				ui:setGenStatus("Mesh generated! (" .. tostring(previewResult) .. " tris)", Color3.fromRGB(76, 175, 80))
+			else
+				ui:setGenProgress(100)
+				ui:setGenStatus("Mesh generated! (preview unavailable)", Color3.fromRGB(76, 175, 80))
+				if not previewOk then
+					warn("[Meshy AI] Preview import failed: " .. tostring(previewResult))
+				end
+			end
+
 			ui:setThumbnail(result.thumbnail_url or "")
 			ui:enableStep(2)
 			ui:enableStep(3)
@@ -1544,8 +1590,17 @@ ui.callbacks.onTexture = function(inputType, prompt)
 				ui:setThumbnail(result.thumbnail_url)
 			end
 
-			ui:setTexProgress(100)
-			ui:setTexStatus("Texture applied!", Color3.fromRGB(76, 175, 80))
+			ui:setTexProgress(80)
+			ui:setTexStatus("Updating preview...")
+
+			local previewOk, previewResult = pcall(importPreview, result.model_urls)
+			if previewOk and previewResult then
+				ui:setTexProgress(100)
+				ui:setTexStatus("Texture applied! (" .. tostring(previewResult) .. " tris)", Color3.fromRGB(76, 175, 80))
+			else
+				ui:setTexProgress(100)
+				ui:setTexStatus("Texture applied! (preview update failed)", Color3.fromRGB(76, 175, 80))
+			end
 		end)
 
 		if not success then
@@ -1594,8 +1649,17 @@ ui.callbacks.onRemesh = function(targetPolycount)
 				ui:setThumbnail(result.thumbnail_url)
 			end
 
-			ui:setRemeshProgress(100)
-			ui:setRemeshStatus("Remesh complete!", Color3.fromRGB(76, 175, 80))
+			ui:setRemeshProgress(80)
+			ui:setRemeshStatus("Updating preview...")
+
+			local previewOk, previewResult = pcall(importPreview, result.model_urls)
+			if previewOk and previewResult then
+				ui:setRemeshProgress(100)
+				ui:setRemeshStatus("Remesh complete! (" .. tostring(previewResult) .. " tris)", Color3.fromRGB(76, 175, 80))
+			else
+				ui:setRemeshProgress(100)
+				ui:setRemeshStatus("Remesh complete! (preview update failed)", Color3.fromRGB(76, 175, 80))
+			end
 		end)
 
 		if not success then
@@ -1607,44 +1671,48 @@ ui.callbacks.onRemesh = function(targetPolycount)
 	end)
 end
 
--- Step 4: Publish to Workspace
+-- Step 4: Publish as permanent Roblox asset
 ui.callbacks.onPublish = function()
 	if state.busy then return end
-	if not state.modelUrls then
+	if not state.previewEditableMesh then
 		ui:showPubProgress()
-		ui:setPubStatus("No model available. Run Generate first.", Color3.fromRGB(244, 67, 54))
+		ui:setPubStatus("No mesh to publish. Run Generate first.", Color3.fromRGB(244, 67, 54))
 		return
 	end
 
 	setBusy(true)
 	ui:showPubProgress()
 	ui:setPubProgress(0)
-	ui:setPubStatus("Preparing to import...")
+	ui:setPubStatus("Publishing asset...")
 
 	task.spawn(function()
-		local autoImportSuccess, autoImportErr = pcall(function()
-			local objUrl = state.modelUrls.obj
-			if not objUrl or objUrl == "" then
-				local glbUrl = state.modelUrls.glb
-				if not glbUrl then
-					error("No downloadable model URL found")
-				end
-				error("OBJ format not available; only GLB. Use manual download.")
+		local success, err = pcall(function()
+			ui:setPubProgress(30)
+			ui:setPubStatus("Creating permanent Roblox asset...")
+
+			local result = AssetService:CreateAssetAsync(
+				state.previewEditableMesh,
+				Enum.AssetType.Mesh,
+				{ Name = "Meshy AI Asset" }
+			)
+
+			-- result may be an AssetId number or a result table
+			local assetId = result
+			if type(result) == "table" then
+				assetId = result.AssetId or result.assetId
 			end
 
-			ui:setPubProgress(20)
-			ui:setPubStatus("Downloading OBJ mesh data...")
+			ui:setPubProgress(70)
+			ui:setPubStatus("Creating MeshPart from published asset...")
 
-			local objText = downloadText(objUrl)
+			-- Create a new MeshPart from the published asset
+			local meshPart = AssetService:CreateMeshPartAsync(
+				Content.fromUri("rbxassetid://" .. tostring(assetId))
+			)
+			meshPart.Name = "MeshyAsset"
+			meshPart.Anchored = true
 
-			ui:setPubProgress(50)
-			ui:setPubStatus("Parsing mesh geometry...")
-
-			local meshPart, triCount = createMeshPartFromOBJ(objText)
-
-			ui:setPubProgress(80)
-			ui:setPubStatus("Adding to workspace (" .. tostring(triCount) .. " triangles)...")
-
+			-- Position near camera
 			local camera = workspace.CurrentCamera
 			if camera then
 				meshPart.Position = camera.CFrame.Position + camera.CFrame.LookVector * 15
@@ -1653,26 +1721,34 @@ ui.callbacks.onPublish = function()
 			meshPart.Parent = workspace
 			Selection:Set({meshPart})
 
+			-- Remove preview since we now have the published version
+			if state.previewMeshPart and state.previewMeshPart.Parent then
+				state.previewMeshPart:Destroy()
+			end
+			state.previewMeshPart = nil
+
 			ui:setPubProgress(100)
-			ui:setPubStatus("Added to workspace! (" .. tostring(triCount) .. " tris)", Color3.fromRGB(76, 175, 80))
+			ui:setPubStatus("Published! Asset ID: " .. tostring(assetId), Color3.fromRGB(76, 175, 80))
+			print("[Meshy AI] Published asset: rbxassetid://" .. tostring(assetId))
 		end)
 
-		if not autoImportSuccess then
-			local links = "Auto-import unavailable: " .. tostring(autoImportErr) .. "\n\nDownload your model manually:"
+		if not success then
+			ui:setPubProgress(0)
+			ui:setPubStatus("Publish failed: " .. tostring(err), Color3.fromRGB(244, 67, 54))
+
+			-- Show download links as fallback
 			if state.modelUrls then
+				local links = "Download your model manually:"
 				if state.modelUrls.glb then links = links .. "\nGLB: " .. state.modelUrls.glb end
 				if state.modelUrls.fbx then links = links .. "\nFBX: " .. state.modelUrls.fbx end
 				if state.modelUrls.obj then links = links .. "\nOBJ: " .. state.modelUrls.obj end
+				ui:setDownloadLinks(links)
+
+				print("[Meshy AI] Model download links:")
+				if state.modelUrls.glb then print("  GLB: " .. state.modelUrls.glb) end
+				if state.modelUrls.fbx then print("  FBX: " .. state.modelUrls.fbx) end
+				if state.modelUrls.obj then print("  OBJ: " .. state.modelUrls.obj) end
 			end
-
-			ui:setPubProgress(0)
-			ui:setPubStatus("Auto-import failed. See download links below.", Color3.fromRGB(255, 152, 0))
-			ui:setDownloadLinks(links)
-
-			print("[Meshy AI] Model download links:")
-			if state.modelUrls.glb then print("  GLB: " .. state.modelUrls.glb) end
-			if state.modelUrls.fbx then print("  FBX: " .. state.modelUrls.fbx) end
-			if state.modelUrls.obj then print("  OBJ: " .. state.modelUrls.obj) end
 		end
 
 		setBusy(false)
