@@ -1,0 +1,13 @@
+# Rojo build output
+*.rbxm
+*.rbxl
+*.rbxlx
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
