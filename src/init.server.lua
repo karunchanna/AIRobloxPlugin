@@ -310,17 +310,12 @@ ui.callbacks.onTexture = function(inputType, prompt)
 				taskId = api:textTo3DRefine(state.currentTaskId, texturePrompt, textureImageUrl)
 			else
 				-- Use retexture API for image-to-3D meshes
-				taskType = "text-to-texture"
-				local objectPrompt = inputType == "text" and prompt or "3D object"
-				local textureImageUrl = inputType == "image" and prompt or nil
+				taskType = "retexture"
+				local textStylePrompt = inputType == "text" and prompt or nil
+				local imageStyleUrl = inputType == "image" and prompt or nil
 
 				ui:setTexStatus("Submitting retexture task...")
-				taskId = api:retexture(
-					state.currentTaskId,
-					objectPrompt,
-					inputType == "text" and prompt or nil,
-					textureImageUrl
-				)
+				taskId = api:retexture(state.currentTaskId, textStylePrompt, imageStyleUrl)
 			end
 
 			ui:setTexStatus("Applying texture...")

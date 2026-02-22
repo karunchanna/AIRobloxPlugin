@@ -16,7 +16,7 @@ local taskWait = task and task.wait or wait
 local ENDPOINTS = {
 	["text-to-3d"] = "/openapi/v2/text-to-3d",
 	["image-to-3d"] = "/openapi/v1/image-to-3d",
-	["text-to-texture"] = "/openapi/v1/text-to-texture",
+	["retexture"] = "/openapi/v1/retexture",
 	["remesh"] = "/openapi/v1/remesh",
 }
 
@@ -133,26 +133,26 @@ function MeshyAPI:imageTo3D(imageUrl: string, shouldTexture: boolean?): string
 end
 
 --[[
-	Create a Retexture (Text-to-Texture) task.
+	Create a Retexture task.
 	Used to apply new textures to an existing mesh from any Meshy task.
+	textStylePrompt: text describing desired texture style.
+	imageStyleUrl: reference image URL to guide texturing.
 	Returns the task ID.
 ]]
-function MeshyAPI:retexture(inputTaskId: string, objectPrompt: string, stylePrompt: string?, textureImageUrl: string?): string
+function MeshyAPI:retexture(inputTaskId: string, textStylePrompt: string?, imageStyleUrl: string?): string
 	local body: any = {
 		input_task_id = inputTaskId,
-		object_prompt = objectPrompt,
 		enable_pbr = true,
-		art_style = "realistic",
 	}
 
-	if textureImageUrl and textureImageUrl ~= "" then
-		body.texture_image_url = textureImageUrl
+	if imageStyleUrl and imageStyleUrl ~= "" then
+		body.image_style_url = imageStyleUrl
 	end
-	if stylePrompt and stylePrompt ~= "" then
-		body.style_prompt = stylePrompt
+	if textStylePrompt and textStylePrompt ~= "" then
+		body.text_style_prompt = textStylePrompt
 	end
 
-	local result = self:_request("POST", ENDPOINTS["text-to-texture"], body)
+	local result = self:_request("POST", ENDPOINTS["retexture"], body)
 	return result.result
 end
 
@@ -174,7 +174,7 @@ end
 
 --[[
 	Retrieve a task by ID.
-	taskType: "text-to-3d", "image-to-3d", "text-to-texture", or "remesh"
+	taskType: "text-to-3d", "image-to-3d", "retexture", or "remesh"
 ]]
 function MeshyAPI:getTask(taskType: string, taskId: string): any
 	local endpoint = ENDPOINTS[taskType]
@@ -206,10 +206,11 @@ function MeshyAPI:pollTask(taskType: string, taskId: string, onProgress: ((numbe
 				onProgress(100)
 			end
 			return task
-		elseif status == "FAILED" then
+		elseif status == "FAILED" or status == "CANCELED" then
 			local errMsg = task.task_error and task.task_error.message or "Unknown error"
-			error("Task failed: " .. errMsg)
+			error("Task " .. status:lower() .. ": " .. errMsg)
 		end
+		-- PENDING, IN_PROGRESS, PROCESSING (remesh uses PROCESSING) all continue polling
 
 		taskWait(POLL_INTERVAL)
 	end
