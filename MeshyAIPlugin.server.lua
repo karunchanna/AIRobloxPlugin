@@ -103,6 +103,349 @@ function OBJParser.getBounds(meshData: any): (Vector3, Vector3, Vector3, Vector3
 end
 
 ------------------------------------------------------------------------
+-- PNGDecoder (minimal decoder for thumbnail preview in ImageLabel)
+-- Supports: 8-bit RGB/RGBA, non-interlaced PNGs
+------------------------------------------------------------------------
+local PNGDecoder = {}
+
+local function readU32BE(data: string, pos: number): number
+	local b1, b2, b3, b4 = string.byte(data, pos, pos + 3)
+	return b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
+end
+
+-- Bit reader (LSB-first within bytes, as per DEFLATE spec)
+local BitReader = {}
+BitReader.__index = BitReader
+
+function BitReader.new(data: string, startPos: number?)
+	return setmetatable({
+		data = data,
+		bytePos = startPos or 1,
+		bitPos = 0,
+	}, BitReader)
+end
+
+function BitReader:readBit(): number
+	if self.bytePos > #self.data then error("Unexpected end of compressed data") end
+	local byte = string.byte(self.data, self.bytePos)
+	local b = bit32.band(bit32.rshift(byte, self.bitPos), 1)
+	self.bitPos += 1
+	if self.bitPos >= 8 then
+		self.bitPos = 0
+		self.bytePos += 1
+	end
+	return b
+end
+
+function BitReader:readBits(n: number): number
+	local result = 0
+	for i = 0, n - 1 do
+		result = bit32.bor(result, bit32.lshift(self:readBit(), i))
+	end
+	return result
+end
+
+function BitReader:alignToByte()
+	if self.bitPos > 0 then
+		self.bitPos = 0
+		self.bytePos += 1
+	end
+end
+
+-- Build canonical Huffman tree from code lengths
+-- Returns a binary tree: { [0]=left, [1]=right } or { symbol=n }
+local function buildHuffTree(codeLengths: {number}): any
+	local maxLen = 0
+	for _, len in ipairs(codeLengths) do
+		if len > maxLen then maxLen = len end
+	end
+	if maxLen == 0 then return { symbol = 0 } end
+
+	local blCount = {}
+	for i = 0, maxLen do blCount[i] = 0 end
+	for _, len in ipairs(codeLengths) do
+		if len > 0 then blCount[len] += 1 end
+	end
+
+	local nextCode = {}
+	local code = 0
+	for bits = 1, maxLen do
+		code = (code + (blCount[bits - 1] or 0)) * 2
+		nextCode[bits] = code
+	end
+
+	local root = {}
+	for symbol = 1, #codeLengths do
+		local len = codeLengths[symbol]
+		if len > 0 then
+			local c = nextCode[len]
+			nextCode[len] += 1
+			local node = root
+			for i = len - 1, 1, -1 do
+				local bit = bit32.band(bit32.rshift(c, i), 1)
+				if not node[bit] then node[bit] = {} end
+				node = node[bit]
+			end
+			node[bit32.band(c, 1)] = { symbol = symbol - 1 }
+		end
+	end
+	return root
+end
+
+local function huffDecode(reader: any, tree: any): number
+	local node = tree
+	if node.symbol then return node.symbol end
+	while true do
+		local bit = reader:readBit()
+		node = node[bit]
+		if not node then error("Invalid Huffman code") end
+		if node.symbol then return node.symbol end
+	end
+end
+
+-- Fixed Huffman trees for DEFLATE block type 1
+local FIXED_LIT_TREE, FIXED_DIST_TREE
+do
+	local ll = {}
+	for i = 1, 144 do ll[i] = 8 end
+	for i = 145, 256 do ll[i] = 9 end
+	for i = 257, 280 do ll[i] = 7 end
+	for i = 281, 288 do ll[i] = 8 end
+	FIXED_LIT_TREE = buildHuffTree(ll)
+
+	local dd = {}
+	for i = 1, 32 do dd[i] = 5 end
+	FIXED_DIST_TREE = buildHuffTree(dd)
+end
+
+-- Length and distance base/extra tables
+local LEN_BASE = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258}
+local LEN_EXTRA = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0}
+local DST_BASE = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577}
+local DST_EXTRA = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13}
+local CL_ORDER = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15}
+
+-- DEFLATE inflate
+local function inflate(reader: any): string
+	local out = {}
+	local final = false
+
+	while not final do
+		final = reader:readBits(1) == 1
+		local btype = reader:readBits(2)
+
+		if btype == 0 then
+			-- Stored block
+			reader:alignToByte()
+			local len = reader:readBits(16)
+			reader:readBits(16) -- nlen (complement, skip)
+			for _ = 1, len do
+				table.insert(out, string.char(reader:readBits(8)))
+			end
+		elseif btype == 1 or btype == 2 then
+			local litTree, dstTree
+
+			if btype == 1 then
+				litTree = FIXED_LIT_TREE
+				dstTree = FIXED_DIST_TREE
+			else
+				-- Dynamic Huffman
+				local hlit = reader:readBits(5) + 257
+				local hdist = reader:readBits(5) + 1
+				local hclen = reader:readBits(4) + 4
+
+				local clLens = {}
+				for i = 1, 19 do clLens[i] = 0 end
+				for i = 1, hclen do
+					clLens[CL_ORDER[i] + 1] = reader:readBits(3)
+				end
+
+				local clTree = buildHuffTree(clLens)
+
+				local allLens = {}
+				local total = hlit + hdist
+				while #allLens < total do
+					local sym = huffDecode(reader, clTree)
+					if sym < 16 then
+						table.insert(allLens, sym)
+					elseif sym == 16 then
+						local rep = reader:readBits(2) + 3
+						local prev = allLens[#allLens] or 0
+						for _ = 1, rep do table.insert(allLens, prev) end
+					elseif sym == 17 then
+						for _ = 1, reader:readBits(3) + 3 do table.insert(allLens, 0) end
+					elseif sym == 18 then
+						for _ = 1, reader:readBits(7) + 11 do table.insert(allLens, 0) end
+					end
+				end
+
+				local litLens = {}
+				for i = 1, hlit do litLens[i] = allLens[i] end
+				local dstLens = {}
+				for i = 1, hdist do dstLens[i] = allLens[hlit + i] end
+
+				litTree = buildHuffTree(litLens)
+				dstTree = buildHuffTree(dstLens)
+			end
+
+			-- Decode literals/lengths
+			while true do
+				local sym = huffDecode(reader, litTree)
+				if sym < 256 then
+					table.insert(out, string.char(sym))
+				elseif sym == 256 then
+					break
+				else
+					local li = sym - 257 + 1
+					local length = LEN_BASE[li] + reader:readBits(LEN_EXTRA[li])
+					local di = huffDecode(reader, dstTree) + 1
+					local distance = DST_BASE[di] + reader:readBits(DST_EXTRA[di])
+					local sp = #out - distance + 1
+					for i = 0, length - 1 do
+						table.insert(out, out[sp + i])
+					end
+				end
+			end
+		else
+			error("Invalid DEFLATE block type")
+		end
+	end
+
+	return table.concat(out)
+end
+
+-- Decode a PNG file (binary string) into width, height, RGBA pixel buffer
+function PNGDecoder.decode(pngData: string): (number, number, buffer?)
+	-- Validate PNG signature
+	if #pngData < 8 or string.sub(pngData, 1, 8) ~= "\137PNG\r\n\26\n" then
+		return 0, 0, nil
+	end
+
+	local pos = 9
+	local width, height, bitDepth, colorType = 0, 0, 0, 0
+	local idatParts = {}
+
+	while pos <= #pngData - 12 do
+		local length = readU32BE(pngData, pos)
+		local ctype = string.sub(pngData, pos + 4, pos + 7)
+		local dataStart = pos + 8
+
+		if ctype == "IHDR" then
+			width = readU32BE(pngData, dataStart)
+			height = readU32BE(pngData, dataStart + 4)
+			bitDepth = string.byte(pngData, dataStart + 8)
+			colorType = string.byte(pngData, dataStart + 9)
+		elseif ctype == "IDAT" then
+			table.insert(idatParts, string.sub(pngData, dataStart, dataStart + length - 1))
+		elseif ctype == "IEND" then
+			break
+		end
+
+		pos = dataStart + length + 4 -- skip CRC
+	end
+
+	if width == 0 or height == 0 then return 0, 0, nil end
+
+	-- Limit to reasonable thumbnail sizes
+	if width > 1024 or height > 1024 then
+		warn("[Meshy AI] PNG too large for thumbnail: " .. width .. "x" .. height)
+		return width, height, nil
+	end
+
+	-- Only support 8-bit RGB (type 2) and RGBA (type 6)
+	local channels
+	if colorType == 2 then channels = 3
+	elseif colorType == 6 then channels = 4
+	else
+		warn("[Meshy AI] Unsupported PNG color type: " .. tostring(colorType))
+		return width, height, nil
+	end
+
+	if bitDepth ~= 8 then
+		warn("[Meshy AI] Unsupported PNG bit depth: " .. tostring(bitDepth))
+		return width, height, nil
+	end
+
+	-- Decompress IDAT data (skip 2-byte zlib header)
+	local compressed = table.concat(idatParts)
+	local startByte = 3 -- skip CMF + FLG
+	if bit32.band(string.byte(compressed, 2), 0x20) ~= 0 then
+		startByte = 7 -- skip FDICT (4 extra bytes)
+	end
+
+	local reader = BitReader.new(compressed, startByte)
+	local decompOk, rawData = pcall(inflate, reader)
+	if not decompOk then
+		warn("[Meshy AI] PNG DEFLATE error: " .. tostring(rawData))
+		return width, height, nil
+	end
+
+	-- Unfilter scanlines
+	local bpp = channels -- bytes per pixel
+	local stride = width * bpp
+	local pixelBuf = buffer.create(width * height * 4)
+
+	local prevRow = {}
+	for i = 1, stride do prevRow[i] = 0 end
+
+	local srcPos = 1
+	for y = 0, height - 1 do
+		if srcPos > #rawData then break end
+		local filterType = string.byte(rawData, srcPos)
+		srcPos += 1
+
+		local curRow = {}
+		for x = 1, stride do
+			if srcPos > #rawData then break end
+			local raw = string.byte(rawData, srcPos)
+			srcPos += 1
+
+			local a = x > bpp and curRow[x - bpp] or 0
+			local b = prevRow[x]
+			local c = x > bpp and prevRow[x - bpp] or 0
+
+			if filterType == 0 then
+				curRow[x] = raw
+			elseif filterType == 1 then
+				curRow[x] = (raw + a) % 256
+			elseif filterType == 2 then
+				curRow[x] = (raw + b) % 256
+			elseif filterType == 3 then
+				curRow[x] = (raw + math.floor((a + b) / 2)) % 256
+			elseif filterType == 4 then
+				local p = a + b - c
+				local pa = math.abs(p - a)
+				local pb = math.abs(p - b)
+				local pc = math.abs(p - c)
+				if pa <= pb and pa <= pc then curRow[x] = (raw + a) % 256
+				elseif pb <= pc then curRow[x] = (raw + b) % 256
+				else curRow[x] = (raw + c) % 256 end
+			else
+				curRow[x] = raw
+			end
+		end
+
+		-- Write RGBA to output buffer
+		for x = 0, width - 1 do
+			local bufPos = (y * width + x) * 4
+			local si = x * bpp + 1
+			buffer.writeu8(pixelBuf, bufPos, curRow[si] or 0)
+			buffer.writeu8(pixelBuf, bufPos + 1, curRow[si + 1] or 0)
+			buffer.writeu8(pixelBuf, bufPos + 2, curRow[si + 2] or 0)
+			if channels == 4 then
+				buffer.writeu8(pixelBuf, bufPos + 3, curRow[si + 3] or 0)
+			else
+				buffer.writeu8(pixelBuf, bufPos + 3, 255)
+			end
+		end
+
+		prevRow = curRow
+	end
+
+	return width, height, pixelBuf
+end
+
+------------------------------------------------------------------------
 -- MeshyAPI
 ------------------------------------------------------------------------
 local MeshyAPI = {}
@@ -1236,11 +1579,31 @@ function UI:disablePublish() self:_setPublishEnabled(false) end
 
 function UI:setThumbnail(url: string)
 	if url and url ~= "" then
-		self._thumbnail.Image = url
-		self._thumbnail.Visible = true
 		self._thumbUrlBox.Text = "Preview: " .. url
 		self._thumbUrlBox.Visible = true
 		print("[Meshy AI] Thumbnail URL: " .. url)
+
+		-- Download and decode the thumbnail image in background
+		task.spawn(function()
+			local editableImage = loadThumbnailImage(url)
+			if editableImage then
+				-- Use ImageContent with Content.fromObject for EditableImage display
+				local contentOk, contentErr = pcall(function()
+					self._thumbnail.ImageContent = Content.fromObject(editableImage)
+				end)
+				if contentOk then
+					self._thumbnail.Visible = true
+					self._editableImageRef = editableImage -- prevent garbage collection
+					print("[Meshy AI] Thumbnail displayed in preview!")
+				else
+					warn("[Meshy AI] Content.fromObject failed: " .. tostring(contentErr))
+					self._thumbnail.Visible = false
+				end
+			else
+				self._thumbnail.Visible = false
+				print("[Meshy AI] Thumbnail URL shown (image decode failed)")
+			end
+		end)
 	else
 		self._thumbnail.Visible = false
 		self._thumbUrlBox.Visible = false
@@ -1374,6 +1737,58 @@ local function downloadText(url: string): string
 		error("Download failed (HTTP " .. response.StatusCode .. ")")
 	end
 	return response.Body
+end
+
+-- Download a thumbnail URL and return an EditableImage (or nil on failure)
+local function loadThumbnailImage(url: string): any?
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync({ Url = url, Method = "GET" })
+	end)
+
+	if not ok or not response or response.StatusCode ~= 200 then
+		warn("[Meshy AI] Failed to download thumbnail: " .. tostring(ok and response and response.StatusCode or response))
+		return nil
+	end
+
+	local pngData = response.Body
+
+	-- Check if it's a PNG (starts with PNG signature)
+	if #pngData < 8 or string.byte(pngData, 1) ~= 137 then
+		warn("[Meshy AI] Thumbnail is not PNG format, cannot decode")
+		return nil
+	end
+
+	local decOk, w, h, pixelBuf = pcall(PNGDecoder.decode, pngData)
+	if not decOk then
+		warn("[Meshy AI] PNG decode error: " .. tostring(w))
+		return nil
+	end
+
+	if not pixelBuf or w == 0 or h == 0 then
+		warn("[Meshy AI] PNG decode returned no pixel data (" .. tostring(w) .. "x" .. tostring(h) .. ")")
+		return nil
+	end
+
+	local imgOk, editableImage = pcall(function()
+		return AssetService:CreateEditableImage({ Size = Vector2.new(w, h) })
+	end)
+
+	if not imgOk or not editableImage then
+		warn("[Meshy AI] Failed to create EditableImage: " .. tostring(editableImage))
+		return nil
+	end
+
+	local writeOk, writeErr = pcall(function()
+		editableImage:WritePixelsBuffer(Vector2.new(0, 0), Vector2.new(w, h), pixelBuf)
+	end)
+
+	if not writeOk then
+		warn("[Meshy AI] WritePixelsBuffer failed: " .. tostring(writeErr))
+		return nil
+	end
+
+	print("[Meshy AI] Thumbnail decoded: " .. w .. "x" .. h)
+	return editableImage
 end
 
 ------------------------------------------------------------------------
@@ -1826,16 +2241,20 @@ ui.callbacks.onPublish = function()
 			ui:setPubProgress(40)
 			ui:setPubStatus("Publishing to Roblox...")
 
-			local result = AssetService:CreateAssetAsync(
+			-- CreateAssetAsync returns TWO values: (Enum.CreateAssetResult, assetId)
+			local createResult, assetId = AssetService:CreateAssetAsync(
 				editableMesh,
 				Enum.AssetType.Mesh,
 				{ Name = "Meshy AI Asset" }
 			)
 
-			-- result may be an AssetId number or a result table
-			local assetId = result
-			if type(result) == "table" then
-				assetId = result.AssetId or result.assetId
+			-- Verify success
+			if createResult ~= Enum.CreateAssetResult.Success then
+				error("Asset creation failed: " .. tostring(createResult))
+			end
+
+			if not assetId or assetId == 0 then
+				error("Asset creation returned no asset ID (result: " .. tostring(createResult) .. ")")
 			end
 
 			print("[Meshy AI] Published asset ID: " .. tostring(assetId))
