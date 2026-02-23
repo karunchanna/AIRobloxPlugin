@@ -920,6 +920,28 @@ function UI:_build()
 	addCorner(thumbnail)
 	self._thumbnail = thumbnail
 
+	-- Thumbnail URL (copyable, since ImageLabel can't load external URLs)
+	local thumbUrlBox = Instance.new("TextBox")
+	thumbUrlBox.Name = "ThumbnailUrl"
+	thumbUrlBox.Size = UDim2.new(1, 0, 0, 28)
+	thumbUrlBox.BackgroundColor3 = Theme.input
+	thumbUrlBox.Font = FONT
+	thumbUrlBox.TextColor3 = Theme.primary
+	thumbUrlBox.TextSize = 11
+	thumbUrlBox.Text = ""
+	thumbUrlBox.PlaceholderText = ""
+	thumbUrlBox.TextXAlignment = Enum.TextXAlignment.Left
+	thumbUrlBox.TextWrapped = false
+	thumbUrlBox.ClearTextOnFocus = false
+	thumbUrlBox.TextEditable = false
+	thumbUrlBox.Visible = false
+	thumbUrlBox.LayoutOrder = nextOrder()
+	thumbUrlBox.Parent = scroll
+	thumbUrlBox.ClipsDescendants = true
+	addCorner(thumbUrlBox)
+	addPadding(thumbUrlBox, 4, 4, 8, 8)
+	self._thumbUrlBox = thumbUrlBox
+
 	createDivider({ LayoutOrder = nextOrder(), Parent = scroll })
 
 	-- Step 2: Texture (Optional)
@@ -1216,8 +1238,12 @@ function UI:setThumbnail(url: string)
 	if url and url ~= "" then
 		self._thumbnail.Image = url
 		self._thumbnail.Visible = true
+		self._thumbUrlBox.Text = "Preview: " .. url
+		self._thumbUrlBox.Visible = true
+		print("[Meshy AI] Thumbnail URL: " .. url)
 	else
 		self._thumbnail.Visible = false
+		self._thumbUrlBox.Visible = false
 	end
 end
 
@@ -1351,9 +1377,12 @@ local function downloadText(url: string): string
 end
 
 ------------------------------------------------------------------------
--- Mesh Import: OBJ -> EditableMesh -> MeshPart
+-- Mesh Import: OBJ -> EditableMesh (separate from MeshPart creation)
 ------------------------------------------------------------------------
-local function createMeshFromOBJ(objText: string)
+
+-- Create an EditableMesh from OBJ text. Returns editableMesh and triCount.
+-- Does NOT create a MeshPart (that's a separate step that may fail).
+local function createEditableMeshFromOBJ(objText: string)
 	local meshData = OBJParser.parse(objText)
 
 	if #meshData.positions == 0 or #meshData.faces == 0 then
@@ -1371,16 +1400,22 @@ local function createMeshFromOBJ(objText: string)
 		vertexIds[i] = editableMesh:AddVertex(pos)
 	end
 
-	-- Add all normals
+	-- Add all normals (pcall each in case of issues)
 	local normalIds = {}
 	for i, normal in ipairs(meshData.normals) do
-		normalIds[i] = editableMesh:AddNormal(normal)
+		local ok, nid = pcall(function()
+			return editableMesh:AddNormal(normal)
+		end)
+		if ok then normalIds[i] = nid end
 	end
 
 	-- Add all UVs (flip V for Roblox: OBJ is bottom-left origin, Roblox is top-left)
 	local uvIds = {}
 	for i, uv in ipairs(meshData.uvs) do
-		uvIds[i] = editableMesh:AddUV(Vector2.new(uv.X, 1 - uv.Y))
+		local ok, uid = pcall(function()
+			return editableMesh:AddUV(Vector2.new(uv.X, 1 - uv.Y))
+		end)
+		if ok then uvIds[i] = uid end
 	end
 
 	-- Add triangles, then assign normals and UVs per-face
@@ -1430,17 +1465,14 @@ local function createMeshFromOBJ(objText: string)
 		error("Failed to create any triangles from OBJ data")
 	end
 
-	-- Create a MeshPart from the EditableMesh via AssetService
-	local meshPart = AssetService:CreateMeshPartAsync(Content.fromObject(editableMesh))
-	meshPart.Name = "MeshyAsset"
-	meshPart.Anchored = true
-
-	return meshPart, editableMesh, triCount
+	print("[Meshy AI] EditableMesh created: " .. #meshData.positions .. " verts, " .. triCount .. " tris")
+	return editableMesh, triCount
 end
 
--- Import preview mesh into workspace, removing any previous preview
+-- Import preview into workspace. Stores editableMesh in state for publish
+-- even if the visual MeshPart creation fails.
 local function importPreview(modelUrls)
-	-- Log available formats for debugging
+	-- Log available formats
 	if modelUrls then
 		local formats = {}
 		for k, v in pairs(modelUrls) do
@@ -1456,7 +1488,7 @@ local function importPreview(modelUrls)
 
 	local objUrl = modelUrls.obj
 	if not objUrl or objUrl == "" then
-		warn("[Meshy AI] OBJ format not available in model_urls, cannot preview")
+		warn("[Meshy AI] OBJ format not available in model_urls, cannot import")
 		return nil
 	end
 
@@ -1470,25 +1502,38 @@ local function importPreview(modelUrls)
 	state.previewMeshPart = nil
 	state.previewEditableMesh = nil
 
-	print("[Meshy AI] Downloading OBJ from: " .. objUrl:sub(1, 80) .. "...")
+	-- Download and parse OBJ
+	print("[Meshy AI] Downloading OBJ...")
 	local objText = downloadText(objUrl)
-	print("[Meshy AI] OBJ downloaded, " .. tostring(#objText) .. " bytes. Parsing...")
+	print("[Meshy AI] OBJ downloaded, " .. tostring(#objText) .. " bytes")
 
-	local meshPart, editableMesh, triCount = createMeshFromOBJ(objText)
-	print("[Meshy AI] Mesh created: " .. tostring(triCount) .. " triangles")
+	local editableMesh, triCount = createEditableMeshFromOBJ(objText)
 
-	-- Position in front of camera
-	local camera = workspace.CurrentCamera
-	if camera then
-		meshPart.Position = camera.CFrame.Position + camera.CFrame.LookVector * 15
-	end
-
-	meshPart.Parent = workspace
-	Selection:Set({meshPart})
-
-	-- Store for later publish
-	state.previewMeshPart = meshPart
+	-- Always store the EditableMesh (needed for publish even if MeshPart fails)
 	state.previewEditableMesh = editableMesh
+
+	-- Try to create a visual MeshPart (may fail — that's OK)
+	local meshPartOk, meshPartResult = pcall(function()
+		return AssetService:CreateMeshPartAsync(Content.fromObject(editableMesh))
+	end)
+
+	if meshPartOk and meshPartResult then
+		meshPartResult.Name = "MeshyAsset_Preview"
+		meshPartResult.Anchored = true
+
+		local camera = workspace.CurrentCamera
+		if camera then
+			meshPartResult.Position = camera.CFrame.Position + camera.CFrame.LookVector * 15
+		end
+
+		meshPartResult.Parent = workspace
+		Selection:Set({meshPartResult})
+		state.previewMeshPart = meshPartResult
+		print("[Meshy AI] 3D preview added to workspace (" .. triCount .. " tris)")
+	else
+		warn("[Meshy AI] 3D preview failed (CreateMeshPartAsync): " .. tostring(meshPartResult))
+		warn("[Meshy AI] EditableMesh is saved — Publish should still work")
+	end
 
 	return triCount
 end
@@ -1564,18 +1609,21 @@ ui.callbacks.onGenerate = function(inputType, prompt, artStyle)
 			ui:setGenProgress(80)
 			ui:setGenStatus("Importing preview into workspace...")
 
-			-- Auto-import preview mesh
+			-- Auto-import preview mesh (EditableMesh is stored even if 3D preview fails)
 			local previewOk, previewErr = pcall(importPreview, result.model_urls)
-			if previewOk and state.previewMeshPart then
-				ui:setGenProgress(100)
-				ui:setGenStatus("Mesh generated and previewed!", Color3.fromRGB(76, 175, 80))
+			if previewOk and state.previewEditableMesh then
+				if state.previewMeshPart then
+					ui:setGenProgress(100)
+					ui:setGenStatus("Mesh generated and previewed!", Color3.fromRGB(76, 175, 80))
+				else
+					ui:setGenProgress(100)
+					ui:setGenStatus("Mesh generated! (see preview URL above)", Color3.fromRGB(76, 175, 80))
+				end
 			else
 				ui:setGenProgress(100)
 				ui:setGenStatus("Mesh generated! (preview failed - check Output)", Color3.fromRGB(255, 152, 0))
 				if not previewOk then
 					warn("[Meshy AI] Preview import error: " .. tostring(previewErr))
-				else
-					warn("[Meshy AI] Preview returned nil (OBJ format likely unavailable)")
 				end
 			end
 
@@ -1653,9 +1701,9 @@ ui.callbacks.onTexture = function(inputType, prompt)
 			ui:setTexStatus("Updating preview...")
 
 			local previewOk, previewErr = pcall(importPreview, result.model_urls)
-			if previewOk and state.previewMeshPart then
+			if previewOk and state.previewEditableMesh then
 				ui:setTexProgress(100)
-				ui:setTexStatus("Texture applied!", Color3.fromRGB(76, 175, 80))
+				ui:setTexStatus("Texture applied! (see preview URL)", Color3.fromRGB(76, 175, 80))
 			else
 				ui:setTexProgress(100)
 				ui:setTexStatus("Texture applied! (preview failed - check Output)", Color3.fromRGB(255, 152, 0))
@@ -1715,9 +1763,14 @@ ui.callbacks.onRemesh = function(targetPolycount)
 			ui:setRemeshStatus("Updating preview...")
 
 			local previewOk, previewErr = pcall(importPreview, result.model_urls)
-			if previewOk and state.previewMeshPart then
-				ui:setRemeshProgress(100)
-				ui:setRemeshStatus("Remesh complete!", Color3.fromRGB(76, 175, 80))
+			if previewOk and state.previewEditableMesh then
+				if state.previewMeshPart then
+					ui:setRemeshProgress(100)
+					ui:setRemeshStatus("Remesh complete!", Color3.fromRGB(76, 175, 80))
+				else
+					ui:setRemeshProgress(100)
+					ui:setRemeshStatus("Remesh complete! (see preview URL)", Color3.fromRGB(76, 175, 80))
+				end
 			else
 				ui:setRemeshProgress(100)
 				ui:setRemeshStatus("Remesh complete! (preview failed - check Output)", Color3.fromRGB(255, 152, 0))
@@ -1752,7 +1805,7 @@ ui.callbacks.onPublish = function()
 
 	task.spawn(function()
 		local success, err = pcall(function()
-			-- If preview didn't work, create the EditableMesh now
+			-- Get or create the EditableMesh
 			local editableMesh = state.previewEditableMesh
 			if not editableMesh then
 				ui:setPubProgress(10)
@@ -1767,14 +1820,11 @@ ui.callbacks.onPublish = function()
 				ui:setPubProgress(20)
 				ui:setPubStatus("Parsing mesh geometry...")
 
-				local meshPart
-				meshPart, editableMesh = createMeshFromOBJ(objText)
-				-- We don't need this meshPart, just the editableMesh
-				meshPart:Destroy()
+				editableMesh = createEditableMeshFromOBJ(objText)
 			end
 
-			ui:setPubProgress(30)
-			ui:setPubStatus("Creating permanent Roblox asset...")
+			ui:setPubProgress(40)
+			ui:setPubStatus("Publishing to Roblox...")
 
 			local result = AssetService:CreateAssetAsync(
 				editableMesh,
@@ -1788,33 +1838,44 @@ ui.callbacks.onPublish = function()
 				assetId = result.AssetId or result.assetId
 			end
 
+			print("[Meshy AI] Published asset ID: " .. tostring(assetId))
+
+			-- Try to insert the published asset into workspace
 			ui:setPubProgress(70)
-			ui:setPubStatus("Creating MeshPart from published asset...")
+			ui:setPubStatus("Inserting into workspace...")
 
-			-- Create a new MeshPart from the published asset
-			local meshPart = AssetService:CreateMeshPartAsync(
-				Content.fromUri("rbxassetid://" .. tostring(assetId))
-			)
-			meshPart.Name = "MeshyAsset"
-			meshPart.Anchored = true
+			local insertOk, insertResult = pcall(function()
+				local meshPart = AssetService:CreateMeshPartAsync(
+					Content.fromUri("rbxassetid://" .. tostring(assetId))
+				)
+				meshPart.Name = "MeshyAsset"
+				meshPart.Anchored = true
 
-			-- Position near camera
-			local camera = workspace.CurrentCamera
-			if camera then
-				meshPart.Position = camera.CFrame.Position + camera.CFrame.LookVector * 15
-			end
+				local camera = workspace.CurrentCamera
+				if camera then
+					meshPart.Position = camera.CFrame.Position + camera.CFrame.LookVector * 15
+				end
 
-			meshPart.Parent = workspace
-			Selection:Set({meshPart})
+				meshPart.Parent = workspace
+				Selection:Set({meshPart})
+				return meshPart
+			end)
 
-			-- Remove preview since we now have the published version
+			-- Remove preview
 			if state.previewMeshPart and state.previewMeshPart.Parent then
 				state.previewMeshPart:Destroy()
 			end
 			state.previewMeshPart = nil
 
-			ui:setPubProgress(100)
-			ui:setPubStatus("Published! Asset ID: " .. tostring(assetId), Color3.fromRGB(76, 175, 80))
+			if insertOk then
+				ui:setPubProgress(100)
+				ui:setPubStatus("Published! Asset ID: " .. tostring(assetId), Color3.fromRGB(76, 175, 80))
+			else
+				warn("[Meshy AI] Insert into workspace failed: " .. tostring(insertResult))
+				ui:setPubProgress(100)
+				ui:setPubStatus("Published! (ID: " .. tostring(assetId) .. ") — insert to workspace failed, use asset ID", Color3.fromRGB(255, 152, 0))
+			end
+
 			print("[Meshy AI] Published asset: rbxassetid://" .. tostring(assetId))
 		end)
 
