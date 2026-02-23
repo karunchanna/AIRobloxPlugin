@@ -855,7 +855,7 @@ function UI:_build()
 	artStyleLayout.Padding = UDim.new(0, 4)
 	artStyleLayout.Parent = artStyleFrame
 
-	local artStyles = {"realistic", "cartoon", "sculpture"}
+	local artStyles = {"realistic", "sculpture"}
 	local artStyleButtons = {}
 	self._selectedArtStyle = "realistic"
 
@@ -1404,9 +1404,24 @@ end
 
 -- Import preview mesh into workspace, removing any previous preview
 local function importPreview(modelUrls)
-	local objUrl = modelUrls and modelUrls.obj
+	-- Log available formats for debugging
+	if modelUrls then
+		local formats = {}
+		for k, v in pairs(modelUrls) do
+			if v and v ~= "" then
+				table.insert(formats, k)
+			end
+		end
+		print("[Meshy AI] Available model formats: " .. table.concat(formats, ", "))
+	else
+		warn("[Meshy AI] No model_urls in task result")
+		return nil
+	end
+
+	local objUrl = modelUrls.obj
 	if not objUrl or objUrl == "" then
-		return -- no OBJ available, skip preview
+		warn("[Meshy AI] OBJ format not available in model_urls, cannot preview")
+		return nil
 	end
 
 	-- Remove old preview
@@ -1416,9 +1431,15 @@ local function importPreview(modelUrls)
 	if state.previewEditableMesh then
 		pcall(function() state.previewEditableMesh:Destroy() end)
 	end
+	state.previewMeshPart = nil
+	state.previewEditableMesh = nil
 
+	print("[Meshy AI] Downloading OBJ from: " .. objUrl:sub(1, 80) .. "...")
 	local objText = downloadText(objUrl)
+	print("[Meshy AI] OBJ downloaded, " .. tostring(#objText) .. " bytes. Parsing...")
+
 	local meshPart, editableMesh, triCount = createMeshFromOBJ(objText)
+	print("[Meshy AI] Mesh created: " .. tostring(triCount) .. " triangles")
 
 	-- Position in front of camera
 	local camera = workspace.CurrentCamera
@@ -1508,15 +1529,17 @@ ui.callbacks.onGenerate = function(inputType, prompt, artStyle)
 			ui:setGenStatus("Importing preview into workspace...")
 
 			-- Auto-import preview mesh
-			local previewOk, previewResult = pcall(importPreview, result.model_urls)
-			if previewOk and previewResult then
+			local previewOk, previewErr = pcall(importPreview, result.model_urls)
+			if previewOk and state.previewMeshPart then
 				ui:setGenProgress(100)
-				ui:setGenStatus("Mesh generated! (" .. tostring(previewResult) .. " tris)", Color3.fromRGB(76, 175, 80))
+				ui:setGenStatus("Mesh generated and previewed!", Color3.fromRGB(76, 175, 80))
 			else
 				ui:setGenProgress(100)
-				ui:setGenStatus("Mesh generated! (preview unavailable)", Color3.fromRGB(76, 175, 80))
+				ui:setGenStatus("Mesh generated! (preview failed - check Output)", Color3.fromRGB(255, 152, 0))
 				if not previewOk then
-					warn("[Meshy AI] Preview import failed: " .. tostring(previewResult))
+					warn("[Meshy AI] Preview import error: " .. tostring(previewErr))
+				else
+					warn("[Meshy AI] Preview returned nil (OBJ format likely unavailable)")
 				end
 			end
 
@@ -1593,13 +1616,16 @@ ui.callbacks.onTexture = function(inputType, prompt)
 			ui:setTexProgress(80)
 			ui:setTexStatus("Updating preview...")
 
-			local previewOk, previewResult = pcall(importPreview, result.model_urls)
-			if previewOk and previewResult then
+			local previewOk, previewErr = pcall(importPreview, result.model_urls)
+			if previewOk and state.previewMeshPart then
 				ui:setTexProgress(100)
-				ui:setTexStatus("Texture applied! (" .. tostring(previewResult) .. " tris)", Color3.fromRGB(76, 175, 80))
+				ui:setTexStatus("Texture applied!", Color3.fromRGB(76, 175, 80))
 			else
 				ui:setTexProgress(100)
-				ui:setTexStatus("Texture applied! (preview update failed)", Color3.fromRGB(76, 175, 80))
+				ui:setTexStatus("Texture applied! (preview failed - check Output)", Color3.fromRGB(255, 152, 0))
+				if not previewOk then
+					warn("[Meshy AI] Texture preview error: " .. tostring(previewErr))
+				end
 			end
 		end)
 
@@ -1652,13 +1678,16 @@ ui.callbacks.onRemesh = function(targetPolycount)
 			ui:setRemeshProgress(80)
 			ui:setRemeshStatus("Updating preview...")
 
-			local previewOk, previewResult = pcall(importPreview, result.model_urls)
-			if previewOk and previewResult then
+			local previewOk, previewErr = pcall(importPreview, result.model_urls)
+			if previewOk and state.previewMeshPart then
 				ui:setRemeshProgress(100)
-				ui:setRemeshStatus("Remesh complete! (" .. tostring(previewResult) .. " tris)", Color3.fromRGB(76, 175, 80))
+				ui:setRemeshStatus("Remesh complete!", Color3.fromRGB(76, 175, 80))
 			else
 				ui:setRemeshProgress(100)
-				ui:setRemeshStatus("Remesh complete! (preview update failed)", Color3.fromRGB(76, 175, 80))
+				ui:setRemeshStatus("Remesh complete! (preview failed - check Output)", Color3.fromRGB(255, 152, 0))
+				if not previewOk then
+					warn("[Meshy AI] Remesh preview error: " .. tostring(previewErr))
+				end
 			end
 		end)
 
@@ -1674,9 +1703,9 @@ end
 -- Step 4: Publish as permanent Roblox asset
 ui.callbacks.onPublish = function()
 	if state.busy then return end
-	if not state.previewEditableMesh then
+	if not state.modelUrls then
 		ui:showPubProgress()
-		ui:setPubStatus("No mesh to publish. Run Generate first.", Color3.fromRGB(244, 67, 54))
+		ui:setPubStatus("No model available. Run Generate first.", Color3.fromRGB(244, 67, 54))
 		return
 	end
 
@@ -1687,11 +1716,32 @@ ui.callbacks.onPublish = function()
 
 	task.spawn(function()
 		local success, err = pcall(function()
+			-- If preview didn't work, create the EditableMesh now
+			local editableMesh = state.previewEditableMesh
+			if not editableMesh then
+				ui:setPubProgress(10)
+				ui:setPubStatus("Downloading mesh data...")
+
+				local objUrl = state.modelUrls.obj
+				if not objUrl or objUrl == "" then
+					error("OBJ format not available. Cannot publish.")
+				end
+
+				local objText = downloadText(objUrl)
+				ui:setPubProgress(20)
+				ui:setPubStatus("Parsing mesh geometry...")
+
+				local meshPart
+				meshPart, editableMesh = createMeshFromOBJ(objText)
+				-- We don't need this meshPart, just the editableMesh
+				meshPart:Destroy()
+			end
+
 			ui:setPubProgress(30)
 			ui:setPubStatus("Creating permanent Roblox asset...")
 
 			local result = AssetService:CreateAssetAsync(
-				state.previewEditableMesh,
+				editableMesh,
 				Enum.AssetType.Mesh,
 				{ Name = "Meshy AI Asset" }
 			)
