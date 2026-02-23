@@ -1138,19 +1138,27 @@ function UI:_build()
 	})
 	self._publishProgress = publishProgress
 
-	local downloadLabel = createLabel({
-		Name = "DownloadLinks",
-		Text = "",
-		TextSize = 12,
-		TextColor3 = Theme.primary,
-		Size = UDim2.new(1, 0, 0, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		LayoutOrder = nextPubOrder(),
-		Parent = publishContainer,
-	})
-	downloadLabel.TextWrapped = true
-	downloadLabel.Visible = false
-	self._downloadLabel = downloadLabel
+	-- Download links (selectable TextBox so users can copy)
+	local downloadBox = Instance.new("TextBox")
+	downloadBox.Name = "DownloadLinks"
+	downloadBox.Size = UDim2.new(1, 0, 0, 0)
+	downloadBox.AutomaticSize = Enum.AutomaticSize.Y
+	downloadBox.BackgroundColor3 = Theme.input
+	downloadBox.Font = FONT
+	downloadBox.TextColor3 = Theme.primary
+	downloadBox.TextSize = 12
+	downloadBox.Text = ""
+	downloadBox.TextXAlignment = Enum.TextXAlignment.Left
+	downloadBox.TextWrapped = true
+	downloadBox.MultiLine = true
+	downloadBox.ClearTextOnFocus = false
+	downloadBox.TextEditable = false
+	downloadBox.Visible = false
+	downloadBox.LayoutOrder = nextPubOrder()
+	downloadBox.Parent = publishContainer
+	addCorner(downloadBox)
+	addPadding(downloadBox, 8, 8, 8, 8)
+	self._downloadLabel = downloadBox
 
 	local spacer = Instance.new("Frame")
 	spacer.Name = "Spacer"
@@ -1214,7 +1222,11 @@ function UI:setThumbnail(url: string)
 end
 
 function UI:setDownloadLinks(text: string)
-	self._downloadLabel.Text = text
+	if text ~= "" then
+		self._downloadLabel.Text = text .. "\n\n(Click text to select, then Ctrl+C to copy. Also printed to Output.)"
+	else
+		self._downloadLabel.Text = ""
+	end
 	self._downloadLabel.Visible = text ~= ""
 end
 
@@ -1348,45 +1360,69 @@ local function createMeshFromOBJ(objText: string)
 		error("OBJ file contains no geometry")
 	end
 
-	-- Use AssetService:CreateEditableMesh() (Instance.new("EditableMesh") was removed)
 	local editableMesh = AssetService:CreateEditableMesh()
 	if not editableMesh then
 		error("Failed to create EditableMesh (memory budget may be exhausted)")
 	end
 
-	local vertexMap = {}
-	local function getOrCreateVertex(posIdx, uvIdx, normalIdx)
-		local key = tostring(posIdx) .. "/" .. tostring(uvIdx or "") .. "/" .. tostring(normalIdx or "")
-		if vertexMap[key] then return vertexMap[key] end
-
-		local pos = meshData.positions[posIdx]
-		if not pos then error("Invalid vertex index: " .. tostring(posIdx)) end
-
-		local vid = editableMesh:AddVertex(pos)
-
-		if normalIdx and meshData.normals[normalIdx] then
-			editableMesh:SetVertexNormal(vid, meshData.normals[normalIdx])
-		end
-
-		if uvIdx and meshData.uvs[uvIdx] then
-			local uv = meshData.uvs[uvIdx]
-			editableMesh:SetUV(vid, Vector2.new(uv.X, 1 - uv.Y))
-		end
-
-		vertexMap[key] = vid
-		return vid
+	-- Add all vertex positions
+	local vertexIds = {}
+	for i, pos in ipairs(meshData.positions) do
+		vertexIds[i] = editableMesh:AddVertex(pos)
 	end
 
+	-- Add all normals
+	local normalIds = {}
+	for i, normal in ipairs(meshData.normals) do
+		normalIds[i] = editableMesh:AddNormal(normal)
+	end
+
+	-- Add all UVs (flip V for Roblox: OBJ is bottom-left origin, Roblox is top-left)
+	local uvIds = {}
+	for i, uv in ipairs(meshData.uvs) do
+		uvIds[i] = editableMesh:AddUV(Vector2.new(uv.X, 1 - uv.Y))
+	end
+
+	-- Add triangles, then assign normals and UVs per-face
 	local triCount = 0
 	for _, face in ipairs(meshData.faces) do
-		local v1 = getOrCreateVertex(face[1].v, face[1].vt, face[1].vn)
-		local v2 = getOrCreateVertex(face[2].v, face[2].vt, face[2].vn)
-		local v3 = getOrCreateVertex(face[3].v, face[3].vt, face[3].vn)
+		local v1 = vertexIds[face[1].v]
+		local v2 = vertexIds[face[2].v]
+		local v3 = vertexIds[face[3].v]
 
-		local ok = pcall(function()
-			editableMesh:AddTriangle(v1, v2, v3)
+		if not v1 or not v2 or not v3 then continue end
+
+		local ok, faceId = pcall(function()
+			return editableMesh:AddTriangle(v1, v2, v3)
 		end)
-		if ok then triCount = triCount + 1 end
+
+		if ok and faceId then
+			triCount = triCount + 1
+
+			-- Assign normals to this face's vertices
+			if face[1].vn and face[2].vn and face[3].vn then
+				local n1 = normalIds[face[1].vn]
+				local n2 = normalIds[face[2].vn]
+				local n3 = normalIds[face[3].vn]
+				if n1 and n2 and n3 then
+					pcall(function()
+						editableMesh:SetFaceNormals(faceId, {n1, n2, n3})
+					end)
+				end
+			end
+
+			-- Assign UVs to this face's vertices
+			if face[1].vt and face[2].vt and face[3].vt then
+				local uv1 = uvIds[face[1].vt]
+				local uv2 = uvIds[face[2].vt]
+				local uv3 = uvIds[face[3].vt]
+				if uv1 and uv2 and uv3 then
+					pcall(function()
+						editableMesh:SetFaceUVs(faceId, {uv1, uv2, uv3})
+					end)
+				end
+			end
+		end
 	end
 
 	if triCount == 0 then
