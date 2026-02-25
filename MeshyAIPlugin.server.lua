@@ -15,6 +15,7 @@
 ]]
 
 local HttpService = game:GetService("HttpService")
+local InsertService = game:GetService("InsertService")
 local Selection = game:GetService("Selection")
 local UserInputService = game:GetService("UserInputService")
 local AssetService = game:GetService("AssetService")
@@ -573,7 +574,7 @@ function MeshyAPI:remesh(inputTaskId: string, targetPolycount: number): string
 		input_task_id = inputTaskId,
 		target_polycount = targetPolycount,
 		topology = "triangle",
-		target_formats = {"obj", "glb"},
+		target_formats = {"obj", "glb", "fbx"},
 	}
 	local result = self:_request("POST", ENDPOINTS["remesh"], body)
 	return result.result
@@ -1122,6 +1123,118 @@ function UI:_build()
 		end
 	end)
 
+	-- Roblox Open Cloud API Key
+	createLabel({
+		Name = "RobloxApiKeyLabel",
+		Text = "Roblox Open Cloud API Key",
+		TextSize = 12,
+		TextColor3 = Theme.textMuted,
+		Size = UDim2.new(1, 0, 0, 16),
+		LayoutOrder = nextOrder(),
+		Parent = scroll,
+	})
+
+	local robloxKeyRow = Instance.new("Frame")
+	robloxKeyRow.Name = "RobloxApiKeyRow"
+	robloxKeyRow.Size = UDim2.new(1, 0, 0, 32)
+	robloxKeyRow.BackgroundTransparency = 1
+	robloxKeyRow.LayoutOrder = nextOrder()
+	robloxKeyRow.Parent = scroll
+
+	local robloxKeyFrame = Instance.new("Frame")
+	robloxKeyFrame.Name = "RobloxApiKeyInputFrame"
+	robloxKeyFrame.Size = UDim2.new(1, -70, 1, 0)
+	robloxKeyFrame.BackgroundColor3 = Theme.input
+	robloxKeyFrame.Parent = robloxKeyRow
+	addCorner(robloxKeyFrame)
+	addBorder(robloxKeyFrame, Theme.inputBorder)
+
+	local robloxKeyInput = Instance.new("TextBox")
+	robloxKeyInput.Name = "RobloxApiKeyInput"
+	robloxKeyInput.Size = UDim2.new(1, -16, 1, 0)
+	robloxKeyInput.Position = UDim2.new(0, 8, 0, 0)
+	robloxKeyInput.BackgroundTransparency = 1
+	robloxKeyInput.Font = FONT
+	robloxKeyInput.TextColor3 = Theme.text
+	robloxKeyInput.PlaceholderColor3 = Theme.textMuted
+	robloxKeyInput.TextSize = 13
+	robloxKeyInput.PlaceholderText = "Enter Roblox API key..."
+	robloxKeyInput.Text = ""
+	robloxKeyInput.TextXAlignment = Enum.TextXAlignment.Left
+	robloxKeyInput.ClearTextOnFocus = false
+	robloxKeyInput.Parent = robloxKeyFrame
+	self._robloxApiKeyInput = robloxKeyInput
+
+	local saveRobloxKeyBtn = createButton({
+		Name = "SaveRobloxKey",
+		Text = "Save",
+		Size = UDim2.new(0, 60, 1, 0),
+		Color = Theme.primary,
+		Parent = robloxKeyRow,
+	})
+	saveRobloxKeyBtn.Position = UDim2.new(1, -60, 0, 0)
+	saveRobloxKeyBtn.Activated:Connect(function()
+		if self.callbacks.onRobloxApiKeySaved then
+			self.callbacks.onRobloxApiKeySaved(robloxKeyInput.Text)
+		end
+	end)
+
+	-- Creator User ID
+	createLabel({
+		Name = "CreatorIdLabel",
+		Text = "Creator User ID (from profile URL)",
+		TextSize = 12,
+		TextColor3 = Theme.textMuted,
+		Size = UDim2.new(1, 0, 0, 16),
+		LayoutOrder = nextOrder(),
+		Parent = scroll,
+	})
+
+	local creatorIdRow = Instance.new("Frame")
+	creatorIdRow.Name = "CreatorIdRow"
+	creatorIdRow.Size = UDim2.new(1, 0, 0, 32)
+	creatorIdRow.BackgroundTransparency = 1
+	creatorIdRow.LayoutOrder = nextOrder()
+	creatorIdRow.Parent = scroll
+
+	local creatorIdFrame = Instance.new("Frame")
+	creatorIdFrame.Name = "CreatorIdInputFrame"
+	creatorIdFrame.Size = UDim2.new(1, -70, 1, 0)
+	creatorIdFrame.BackgroundColor3 = Theme.input
+	creatorIdFrame.Parent = creatorIdRow
+	addCorner(creatorIdFrame)
+	addBorder(creatorIdFrame, Theme.inputBorder)
+
+	local creatorIdInput = Instance.new("TextBox")
+	creatorIdInput.Name = "CreatorIdInput"
+	creatorIdInput.Size = UDim2.new(1, -16, 1, 0)
+	creatorIdInput.Position = UDim2.new(0, 8, 0, 0)
+	creatorIdInput.BackgroundTransparency = 1
+	creatorIdInput.Font = FONT
+	creatorIdInput.TextColor3 = Theme.text
+	creatorIdInput.PlaceholderColor3 = Theme.textMuted
+	creatorIdInput.TextSize = 13
+	creatorIdInput.PlaceholderText = "Your Roblox User ID..."
+	creatorIdInput.Text = ""
+	creatorIdInput.TextXAlignment = Enum.TextXAlignment.Left
+	creatorIdInput.ClearTextOnFocus = false
+	creatorIdInput.Parent = creatorIdFrame
+	self._creatorIdInput = creatorIdInput
+
+	local saveCreatorIdBtn = createButton({
+		Name = "SaveCreatorId",
+		Text = "Save",
+		Size = UDim2.new(0, 60, 1, 0),
+		Color = Theme.primary,
+		Parent = creatorIdRow,
+	})
+	saveCreatorIdBtn.Position = UDim2.new(1, -60, 0, 0)
+	saveCreatorIdBtn.Activated:Connect(function()
+		if self.callbacks.onCreatorIdSaved then
+			self.callbacks.onCreatorIdSaved(creatorIdInput.Text)
+		end
+	end)
+
 	createDivider({ LayoutOrder = nextOrder(), Parent = scroll })
 
 	-- Step 1: Generate Mesh
@@ -1572,6 +1685,8 @@ function UI:_setPublishEnabled(enabled: boolean)
 end
 
 function UI:setApiKey(key: string) self._apiKeyInput.Text = key end
+function UI:setRobloxApiKey(key: string) self._robloxApiKeyInput.Text = key end
+function UI:setCreatorId(id: string) self._creatorIdInput.Text = id end
 function UI:enableStep(step: number) self:_setStepEnabled(step, true) end
 function UI:disableStep(step: number) self:_setStepEnabled(step, false) end
 function UI:enablePublish() self:_setPublishEnabled(true) end
@@ -1700,7 +1815,7 @@ local state = {
 }
 
 ------------------------------------------------------------------------
--- Persistence: load/save API key
+-- Persistence: load/save API keys
 ------------------------------------------------------------------------
 local function loadApiKey()
 	local key = plugin:GetSetting("MeshyApiKey")
@@ -1715,7 +1830,31 @@ local function saveApiKey(key)
 	api:setApiKey(key)
 end
 
+local function loadRobloxSettings()
+	local robloxKey = plugin:GetSetting("RobloxApiKey")
+	if robloxKey and robloxKey ~= "" then
+		ui:setRobloxApiKey(robloxKey)
+	end
+
+	local creatorId = plugin:GetSetting("RobloxCreatorId")
+	if creatorId and creatorId ~= "" then
+		ui:setCreatorId(creatorId)
+	elseif game.CreatorId > 0 and game.CreatorType == Enum.CreatorType.User then
+		-- Auto-populate from the current place's creator
+		ui:setCreatorId(tostring(game.CreatorId))
+	end
+end
+
+local function saveRobloxApiKey(key)
+	plugin:SetSetting("RobloxApiKey", key)
+end
+
+local function saveCreatorId(id)
+	plugin:SetSetting("RobloxCreatorId", id)
+end
+
 loadApiKey()
+loadRobloxSettings()
 
 ------------------------------------------------------------------------
 -- Helpers
@@ -1954,6 +2093,108 @@ local function importPreview(modelUrls)
 end
 
 ------------------------------------------------------------------------
+-- Open Cloud: Upload FBX to Roblox
+------------------------------------------------------------------------
+
+local function uploadToRobloxCloud(fbxData: string, displayName: string, robloxApiKey: string, creatorId: string): any
+	local boundary = "----RobloxBoundary" .. HttpService:GenerateGUID(false):gsub("-", "")
+
+	local requestJson = HttpService:JSONEncode({
+		assetType = "Model",
+		displayName = displayName,
+		description = "Generated by Meshy AI Plugin",
+		creationContext = {
+			creator = {
+				userId = creatorId,
+			},
+		},
+	})
+
+	local body = "--" .. boundary .. "\r\n"
+		.. "Content-Disposition: form-data; name=\"request\"\r\n"
+		.. "Content-Type: application/json\r\n"
+		.. "\r\n"
+		.. requestJson .. "\r\n"
+		.. "--" .. boundary .. "\r\n"
+		.. "Content-Disposition: form-data; name=\"fileContent\"; filename=\"model.fbx\"\r\n"
+		.. "Content-Type: model/fbx\r\n"
+		.. "\r\n"
+		.. fbxData .. "\r\n"
+		.. "--" .. boundary .. "--\r\n"
+
+	local response = HttpService:RequestAsync({
+		Url = "https://apis.roblox.com/assets/v1/assets",
+		Method = "POST",
+		Headers = {
+			["x-api-key"] = robloxApiKey,
+			["Content-Type"] = "multipart/form-data; boundary=" .. boundary,
+		},
+		Body = body,
+	})
+
+	if response.StatusCode < 200 or response.StatusCode >= 300 then
+		local errorMsg = "Open Cloud upload failed (HTTP " .. response.StatusCode .. ")"
+		pcall(function()
+			local decoded = HttpService:JSONDecode(response.Body)
+			if decoded.message then
+				errorMsg = errorMsg .. ": " .. decoded.message
+			end
+		end)
+		error(errorMsg)
+	end
+
+	return HttpService:JSONDecode(response.Body)
+end
+
+local function pollRobloxOperation(operationPath: string, robloxApiKey: string): any
+	local MAX_POLLS = 60
+	local POLL_INTERVAL = 3
+
+	-- Extract operation ID from path like "operations/xxx"
+	local operationId = operationPath:match("operations/(.+)")
+	if not operationId then
+		error("Invalid operation path: " .. tostring(operationPath))
+	end
+
+	local url = "https://apis.roblox.com/assets/v1/operations/" .. operationId
+
+	for _ = 1, MAX_POLLS do
+		taskWait(POLL_INTERVAL)
+
+		local ok, response = pcall(function()
+			return HttpService:RequestAsync({
+				Url = url,
+				Method = "GET",
+				Headers = {
+					["x-api-key"] = robloxApiKey,
+				},
+			})
+		end)
+
+		if ok and response.StatusCode == 200 then
+			local result = HttpService:JSONDecode(response.Body)
+			if result.done then
+				if result.response then
+					return result.response
+				end
+				return result
+			end
+		elseif ok and response.StatusCode >= 400 then
+			local errorMsg = "Operation check failed (HTTP " .. response.StatusCode .. ")"
+			pcall(function()
+				local decoded = HttpService:JSONDecode(response.Body)
+				if decoded.message then
+					errorMsg = errorMsg .. ": " .. decoded.message
+				end
+			end)
+			error(errorMsg)
+		end
+	end
+
+	error("Operation timed out after " .. tostring(MAX_POLLS * POLL_INTERVAL) .. " seconds")
+end
+
+------------------------------------------------------------------------
 -- Callbacks
 ------------------------------------------------------------------------
 
@@ -1968,6 +2209,34 @@ ui.callbacks.onApiKeySaved = function(key)
 	ui:setGenStatus("API key saved!", Color3.fromRGB(76, 175, 80))
 	task.delay(2, function()
 		ui:resetGenProgress()
+	end)
+end
+
+ui.callbacks.onRobloxApiKeySaved = function(key)
+	if key == "" then
+		ui:showPubProgress()
+		ui:setPubStatus("Please enter a valid Roblox API key.", Color3.fromRGB(244, 67, 54))
+		return
+	end
+	saveRobloxApiKey(key)
+	ui:showPubProgress()
+	ui:setPubStatus("Roblox API key saved!", Color3.fromRGB(76, 175, 80))
+	task.delay(2, function()
+		ui:resetPubProgress()
+	end)
+end
+
+ui.callbacks.onCreatorIdSaved = function(id)
+	if id == "" then
+		ui:showPubProgress()
+		ui:setPubStatus("Please enter your Creator User ID.", Color3.fromRGB(244, 67, 54))
+		return
+	end
+	saveCreatorId(id)
+	ui:showPubProgress()
+	ui:setPubStatus("Creator ID saved!", Color3.fromRGB(76, 175, 80))
+	task.delay(2, function()
+		ui:resetPubProgress()
 	end)
 end
 
@@ -2204,7 +2473,7 @@ ui.callbacks.onRemesh = function(targetPolycount)
 	end)
 end
 
--- Step 4: Publish as permanent Roblox asset
+-- Step 4: Publish via Open Cloud (FBX upload)
 ui.callbacks.onPublish = function()
 	if state.busy then return end
 	if not state.modelUrls then
@@ -2213,74 +2482,159 @@ ui.callbacks.onPublish = function()
 		return
 	end
 
+	-- Validate Roblox settings
+	local robloxApiKey = plugin:GetSetting("RobloxApiKey") or ""
+	local creatorId = plugin:GetSetting("RobloxCreatorId") or ""
+
+	if robloxApiKey == "" then
+		ui:showPubProgress()
+		ui:setPubStatus("Enter your Roblox Open Cloud API Key in Settings above.", Color3.fromRGB(244, 67, 54))
+		return
+	end
+
+	if creatorId == "" then
+		ui:showPubProgress()
+		ui:setPubStatus("Enter your Creator User ID in Settings above.", Color3.fromRGB(244, 67, 54))
+		return
+	end
+
+	-- Prefer FBX, fall back to GLB
+	local modelUrl = state.modelUrls.fbx
+	local modelFormat = "fbx"
+	local contentType = "model/fbx"
+	local fileExt = "model.fbx"
+
+	if not modelUrl or modelUrl == "" then
+		modelUrl = state.modelUrls.glb
+		modelFormat = "glb"
+		contentType = "model/gltf-binary"
+		fileExt = "model.glb"
+	end
+
+	if not modelUrl or modelUrl == "" then
+		ui:showPubProgress()
+		ui:setPubStatus("No FBX or GLB format available. Cannot publish.", Color3.fromRGB(244, 67, 54))
+		return
+	end
+
 	setBusy(true)
 	ui:showPubProgress()
 	ui:setPubProgress(0)
-	ui:setPubStatus("Publishing asset...")
+	ui:setPubStatus("Publishing asset via Open Cloud...")
 
 	task.spawn(function()
 		local success, err = pcall(function()
-			-- Get or create the EditableMesh
-			local editableMesh = state.previewEditableMesh
-			if not editableMesh then
-				ui:setPubProgress(10)
-				ui:setPubStatus("Downloading mesh data...")
+			-- Step 1: Download model file from Meshy
+			ui:setPubProgress(10)
+			ui:setPubStatus("Downloading " .. string.upper(modelFormat) .. " model...")
 
-				local objUrl = state.modelUrls.obj
-				if not objUrl or objUrl == "" then
-					error("OBJ format not available. Cannot publish.")
-				end
+			local modelData = downloadText(modelUrl) -- binary-safe in Luau
+			print("[Meshy AI] " .. string.upper(modelFormat) .. " downloaded, " .. tostring(#modelData) .. " bytes")
 
-				local objText = downloadText(objUrl)
-				ui:setPubProgress(20)
-				ui:setPubStatus("Parsing mesh geometry...")
+			-- Step 2: Upload to Roblox Open Cloud
+			ui:setPubProgress(30)
+			ui:setPubStatus("Uploading to Roblox Open Cloud...")
 
-				editableMesh = createEditableMeshFromOBJ(objText)
+			local boundary = "----RobloxBoundary" .. HttpService:GenerateGUID(false):gsub("-", "")
+
+			local requestJson = HttpService:JSONEncode({
+				assetType = "Model",
+				displayName = "Meshy AI Asset",
+				description = "Generated by Meshy AI Plugin",
+				creationContext = {
+					creator = {
+						userId = creatorId,
+					},
+				},
+			})
+
+			local body = "--" .. boundary .. "\r\n"
+				.. "Content-Disposition: form-data; name=\"request\"\r\n"
+				.. "Content-Type: application/json\r\n"
+				.. "\r\n"
+				.. requestJson .. "\r\n"
+				.. "--" .. boundary .. "\r\n"
+				.. "Content-Disposition: form-data; name=\"fileContent\"; filename=\"" .. fileExt .. "\"\r\n"
+				.. "Content-Type: " .. contentType .. "\r\n"
+				.. "\r\n"
+				.. modelData .. "\r\n"
+				.. "--" .. boundary .. "--\r\n"
+
+			local uploadResponse = HttpService:RequestAsync({
+				Url = "https://apis.roblox.com/assets/v1/assets",
+				Method = "POST",
+				Headers = {
+					["x-api-key"] = robloxApiKey,
+					["Content-Type"] = "multipart/form-data; boundary=" .. boundary,
+				},
+				Body = body,
+			})
+
+			if uploadResponse.StatusCode < 200 or uploadResponse.StatusCode >= 300 then
+				local errorMsg = "Open Cloud upload failed (HTTP " .. uploadResponse.StatusCode .. ")"
+				pcall(function()
+					local decoded = HttpService:JSONDecode(uploadResponse.Body)
+					if decoded.message then
+						errorMsg = errorMsg .. ": " .. decoded.message
+					end
+				end)
+				error(errorMsg)
 			end
 
-			ui:setPubProgress(40)
-			ui:setPubStatus("Publishing to Roblox...")
+			local uploadResult = HttpService:JSONDecode(uploadResponse.Body)
+			local operationPath = uploadResult.path
+			print("[Meshy AI] Upload submitted, operation: " .. tostring(operationPath))
 
-			-- CreateAssetAsync returns TWO values: (Enum.CreateAssetResult, assetId)
-			local createResult, assetId = AssetService:CreateAssetAsync(
-				editableMesh,
-				Enum.AssetType.Mesh,
-				{ Name = "Meshy AI Asset" }
-			)
-
-			-- Verify success
-			if createResult ~= Enum.CreateAssetResult.Success then
-				error("Asset creation failed: " .. tostring(createResult))
+			-- Check if already done (sometimes instant)
+			local assetId = nil
+			if uploadResult.done and uploadResult.response then
+				assetId = uploadResult.response.assetId
 			end
 
-			if not assetId or assetId == 0 then
-				error("Asset creation returned no asset ID (result: " .. tostring(createResult) .. ")")
+			-- Step 3: Poll for completion
+			if not assetId then
+				ui:setPubProgress(50)
+				ui:setPubStatus("Processing asset on Roblox (this may take a moment)...")
+
+				local assetResponse = pollRobloxOperation(operationPath, robloxApiKey)
+				assetId = assetResponse.assetId
 			end
 
-			print("[Meshy AI] Published asset ID: " .. tostring(assetId))
+			if not assetId then
+				error("Asset upload completed but no asset ID was returned")
+			end
 
-			-- Try to insert the published asset into workspace
-			ui:setPubProgress(70)
+			print("[Meshy AI] Asset created, ID: " .. tostring(assetId))
+
+			-- Step 4: Insert into workspace
+			ui:setPubProgress(80)
 			ui:setPubStatus("Inserting into workspace...")
 
-			local insertOk, insertResult = pcall(function()
-				local meshPart = AssetService:CreateMeshPartAsync(
-					Content.fromUri("rbxassetid://" .. tostring(assetId))
-				)
-				meshPart.Name = "MeshyAsset"
-				meshPart.Anchored = true
+			local insertOk, insertErr = pcall(function()
+				local model = InsertService:LoadAsset(tonumber(assetId))
+				local children = model:GetChildren()
+				local inserted = {}
 
-				local camera = workspace.CurrentCamera
-				if camera then
-					meshPart.Position = camera.CFrame.Position + camera.CFrame.LookVector * 15
+				for _, child in ipairs(children) do
+					if child:IsA("BasePart") then
+						child.Anchored = true
+						local camera = workspace.CurrentCamera
+						if camera then
+							child.Position = camera.CFrame.Position + camera.CFrame.LookVector * 15
+						end
+					end
+					child.Parent = workspace
+					table.insert(inserted, child)
 				end
 
-				meshPart.Parent = workspace
-				Selection:Set({meshPart})
-				return meshPart
+				model:Destroy()
+
+				if #inserted > 0 then
+					Selection:Set(inserted)
+				end
 			end)
 
-			-- Remove preview
+			-- Remove preview mesh if present
 			if state.previewMeshPart and state.previewMeshPart.Parent then
 				state.previewMeshPart:Destroy()
 			end
@@ -2290,9 +2644,9 @@ ui.callbacks.onPublish = function()
 				ui:setPubProgress(100)
 				ui:setPubStatus("Published! Asset ID: " .. tostring(assetId), Color3.fromRGB(76, 175, 80))
 			else
-				warn("[Meshy AI] Insert into workspace failed: " .. tostring(insertResult))
+				warn("[Meshy AI] Workspace insert failed: " .. tostring(insertErr))
 				ui:setPubProgress(100)
-				ui:setPubStatus("Published! (ID: " .. tostring(assetId) .. ") — insert to workspace failed, use asset ID", Color3.fromRGB(255, 152, 0))
+				ui:setPubStatus("Published (ID: " .. tostring(assetId) .. ") — use Insert > Toolbox to add it", Color3.fromRGB(255, 152, 0))
 			end
 
 			print("[Meshy AI] Published asset: rbxassetid://" .. tostring(assetId))
