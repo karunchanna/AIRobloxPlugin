@@ -2516,15 +2516,40 @@ ui.callbacks.onPublish = function()
 			local textureUrl = nil
 
 			if state.textureUrls then
-				-- Meshy returns base_color as the main diffuse texture
-				textureUrl = state.textureUrls.base_color
-					or state.textureUrls.basecolor
-					or state.textureUrls.baseColor
+				-- Log all available texture keys for debugging
+				local texKeys = {}
+				for k, v in pairs(state.textureUrls) do
+					table.insert(texKeys, k .. "=" .. tostring(v):sub(1, 60))
+				end
+				print("[Meshy AI] Available texture URLs: " .. table.concat(texKeys, " | "))
+
+				-- Try known key names for the diffuse/base color texture
+				for _, key in ipairs({"base_color", "basecolor", "baseColor", "diffuse", "albedo"}) do
+					if state.textureUrls[key] and state.textureUrls[key] ~= "" then
+						textureUrl = state.textureUrls[key]
+						print("[Meshy AI] Using texture key: " .. key)
+						break
+					end
+				end
+
+				-- Fallback: use the first available URL
+				if not textureUrl then
+					for k, v in pairs(state.textureUrls) do
+						if type(v) == "string" and v ~= "" and v:match("^https?://") then
+							textureUrl = v
+							print("[Meshy AI] Using fallback texture key: " .. k)
+							break
+						end
+					end
+				end
+			else
+				print("[Meshy AI] state.textureUrls is nil")
 			end
 
 			if textureUrl and textureUrl ~= "" then
 				ui:setPubProgress(15)
 				ui:setPubStatus("Downloading texture...")
+				print("[Meshy AI] Downloading texture from: " .. textureUrl:sub(1, 80))
 
 				local texOk, texResult = pcall(function()
 					return loadThumbnailImage(textureUrl) -- reuse PNG download+decode
@@ -2538,7 +2563,7 @@ ui.callbacks.onPublish = function()
 					warn("[Meshy AI] Will publish mesh without texture")
 				end
 			else
-				print("[Meshy AI] No texture URL available — publishing mesh only")
+				print("[Meshy AI] No texture URL found — publishing mesh only")
 			end
 
 			------------------------------------------------------------
@@ -2547,17 +2572,27 @@ ui.callbacks.onPublish = function()
 			ui:setPubProgress(30)
 			ui:setPubStatus("Publishing mesh to Roblox...")
 
-			local meshResult, meshAssetId = AssetService:CreateAssetAsync(
+			-- CreateAssetAsync returns: (Enum.CreateAssetResult, assetId: number)
+			local meshReturnA, meshReturnB = AssetService:CreateAssetAsync(
 				editableMesh,
 				Enum.AssetType.Mesh,
 				{ Name = "Meshy AI Mesh" }
 			)
 
-			if meshResult ~= Enum.CreateAssetResult.Success then
-				error("Mesh publish failed: " .. tostring(meshResult))
+			print("[Meshy AI] Mesh CreateAssetAsync returned: " .. tostring(meshReturnA) .. ", " .. tostring(meshReturnB))
+
+			-- Handle both possible return patterns:
+			-- Pattern 1: (Enum.CreateAssetResult, assetId)
+			-- Pattern 2: (assetId) or object with assetId
+			local meshAssetId = nil
+			if type(meshReturnB) == "number" and meshReturnB > 0 then
+				meshAssetId = meshReturnB
+			elseif type(meshReturnA) == "number" and meshReturnA > 0 then
+				meshAssetId = meshReturnA
 			end
-			if not meshAssetId or meshAssetId == 0 then
-				error("Mesh publish returned no asset ID")
+
+			if not meshAssetId then
+				error("Mesh publish failed — returned: " .. tostring(meshReturnA) .. ", " .. tostring(meshReturnB))
 			end
 
 			print("[Meshy AI] Mesh published — rbxassetid://" .. tostring(meshAssetId))
@@ -2571,7 +2606,7 @@ ui.callbacks.onPublish = function()
 				ui:setPubProgress(50)
 				ui:setPubStatus("Publishing texture to Roblox...")
 
-				local texPubOk, texPubResult, texPubId = pcall(function()
+				local texPubOk, texRetA, texRetB = pcall(function()
 					return AssetService:CreateAssetAsync(
 						editableImage,
 						Enum.AssetType.Decal,
@@ -2579,11 +2614,23 @@ ui.callbacks.onPublish = function()
 					)
 				end)
 
-				if texPubOk and texPubResult == Enum.CreateAssetResult.Success and texPubId and texPubId ~= 0 then
-					textureAssetId = texPubId
-					print("[Meshy AI] Texture published — rbxassetid://" .. tostring(textureAssetId))
+				print("[Meshy AI] Texture CreateAssetAsync returned: ok=" .. tostring(texPubOk) .. ", " .. tostring(texRetA) .. ", " .. tostring(texRetB))
+
+				if texPubOk then
+					-- Same flexible extraction as mesh
+					if type(texRetB) == "number" and texRetB > 0 then
+						textureAssetId = texRetB
+					elseif type(texRetA) == "number" and texRetA > 0 then
+						textureAssetId = texRetA
+					end
+
+					if textureAssetId then
+						print("[Meshy AI] Texture published — rbxassetid://" .. tostring(textureAssetId))
+					else
+						warn("[Meshy AI] Texture publish returned no asset ID: " .. tostring(texRetA) .. ", " .. tostring(texRetB))
+					end
 				else
-					warn("[Meshy AI] Texture publish failed: " .. tostring(texPubResult) .. " / " .. tostring(texPubId))
+					warn("[Meshy AI] Texture publish error: " .. tostring(texRetA))
 					warn("[Meshy AI] Continuing with mesh only")
 				end
 			end
