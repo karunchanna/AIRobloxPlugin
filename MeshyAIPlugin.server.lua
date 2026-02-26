@@ -1698,25 +1698,56 @@ function UI:setThumbnail(url: string)
 		self._thumbUrlBox.Visible = true
 		print("[Meshy AI] Thumbnail URL: " .. url)
 
-		-- Download and decode the thumbnail image in background
+		-- Check cache first (avoid re-uploading same thumbnail)
+		self._thumbnailCache = self._thumbnailCache or {}
+		if self._thumbnailCache[url] then
+			self._thumbnail.Image = "rbxassetid://" .. tostring(self._thumbnailCache[url])
+			self._thumbnail.Visible = true
+			print("[Meshy AI] Thumbnail loaded from cache: " .. tostring(self._thumbnailCache[url]))
+			return
+		end
+
+		-- Download, decode, publish as Decal, then display via rbxassetid://
 		task.spawn(function()
 			local editableImage = loadThumbnailImage(url)
-			if editableImage then
-				-- Use ImageContent with Content.fromObject for EditableImage display
-				local contentOk, contentErr = pcall(function()
-					self._thumbnail.ImageContent = Content.fromObject(editableImage)
-				end)
-				if contentOk then
-					self._thumbnail.Visible = true
-					self._editableImageRef = editableImage -- prevent garbage collection
-					print("[Meshy AI] Thumbnail displayed in preview!")
-				else
-					warn("[Meshy AI] Content.fromObject failed: " .. tostring(contentErr))
-					self._thumbnail.Visible = false
-				end
-			else
+			if not editableImage then
 				self._thumbnail.Visible = false
-				print("[Meshy AI] Thumbnail URL shown (image decode failed)")
+				return
+			end
+
+			-- Publish the EditableImage as a Decal to get a real asset ID
+			local pubOk, pubRetA, pubRetB = pcall(function()
+				return AssetService:CreateAssetAsync(
+					editableImage,
+					Enum.AssetType.Decal,
+					{ Name = "Meshy AI Preview" }
+				)
+			end)
+
+			if not pubOk then
+				warn("[Meshy AI] Thumbnail publish failed: " .. tostring(pubRetA))
+				self._thumbnail.Visible = false
+				return
+			end
+
+			print("[Meshy AI] Thumbnail CreateAssetAsync returned: " .. tostring(pubRetA) .. ", " .. tostring(pubRetB))
+
+			-- Extract asset ID (flexible for different return patterns)
+			local assetId = nil
+			if type(pubRetB) == "number" and pubRetB > 0 then
+				assetId = pubRetB
+			elseif type(pubRetA) == "number" and pubRetA > 0 then
+				assetId = pubRetA
+			end
+
+			if assetId then
+				self._thumbnailCache[url] = assetId
+				self._thumbnail.Image = "rbxassetid://" .. tostring(assetId)
+				self._thumbnail.Visible = true
+				print("[Meshy AI] Thumbnail displayed! rbxassetid://" .. tostring(assetId))
+			else
+				warn("[Meshy AI] Thumbnail publish returned no asset ID: " .. tostring(pubRetA) .. ", " .. tostring(pubRetB))
+				self._thumbnail.Visible = false
 			end
 		end)
 	else
@@ -1885,15 +1916,22 @@ local function loadThumbnailImage(url: string): any?
 	end)
 
 	if not ok or not response or response.StatusCode ~= 200 then
-		warn("[Meshy AI] Failed to download thumbnail: " .. tostring(ok and response and response.StatusCode or response))
+		warn("[Meshy AI] Failed to download image: " .. tostring(ok and response and response.StatusCode or response))
 		return nil
 	end
 
 	local pngData = response.Body
+	print("[Meshy AI] Image downloaded: " .. tostring(#pngData) .. " bytes, first byte: " .. tostring(string.byte(pngData, 1)))
 
-	-- Check if it's a PNG (starts with PNG signature)
+	-- Skip if too large (pure-Luau PNG decode is slow on big files)
+	if #pngData > 500000 then
+		warn("[Meshy AI] Image too large for Luau decode (" .. tostring(#pngData) .. " bytes), skipping")
+		return nil
+	end
+
+	-- Check if it's a PNG (starts with PNG signature: 0x89)
 	if #pngData < 8 or string.byte(pngData, 1) ~= 137 then
-		warn("[Meshy AI] Thumbnail is not PNG format, cannot decode")
+		warn("[Meshy AI] Image is not PNG format (byte 1 = " .. tostring(string.byte(pngData, 1)) .. "), cannot decode")
 		return nil
 	end
 
