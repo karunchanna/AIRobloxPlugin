@@ -1,83 +1,54 @@
 # Meshy AI Asset Generator - Roblox Studio Plugin
 
-A Roblox Studio plugin that integrates with the [Meshy API](https://www.meshy.ai/api) to generate, texture, and remesh 3D assets directly within Studio.
-
-## Features
-
-- **Generate Mesh** - Create 3D models from text prompts or reference images using Meshy's AI
-- **Texture** - Apply AI-generated textures using text descriptions or reference images
-- **Remesh** - Reduce triangle count with a slider (1,000 - 20,000) to stay within Roblox's limits
-- **Publish to Workspace** - Import the final mesh directly into your game's workspace
+A single-file Roblox Studio plugin that generates, textures, remeshes, and publishes 3D assets using the [Meshy AI API](https://www.meshy.ai/api).
 
 ## Prerequisites
 
 - [Roblox Studio](https://www.roblox.com/create)
-- A [Meshy API key](https://www.meshy.ai/api) (create an account at meshy.ai)
-- [Rojo](https://rojo.space/) (for building from source)
-- **EditableImage and EditableMesh** beta feature enabled in Studio (Settings > Beta Features) for auto-import
+- A **Meshy API key** — sign up at [meshy.ai/api](https://www.meshy.ai/api) and generate a key
 
 ## Installation
 
-### Option 1: Build with Rojo (Recommended)
-
-1. Install [Rojo](https://rojo.space/docs/v7/getting-started/installation/)
-2. Clone this repository
-3. Build the plugin:
-   ```bash
-   rojo build -o MeshyAIPlugin.rbxm
-   ```
-4. Copy `MeshyAIPlugin.rbxm` to your Roblox Studio plugins folder:
-   - **Windows:** `%LOCALAPPDATA%/Roblox/Plugins/`
+1. Copy `MeshyAIPlugin.server.lua` into your Roblox Studio **Plugins** folder:
+   - **Windows:** `%LOCALAPPDATA%\Roblox\Plugins\`
    - **macOS:** `~/Documents/Roblox/Plugins/`
-5. Restart Roblox Studio
+2. Restart Roblox Studio (or reload plugins)
+3. You should see a **"Meshy AI"** button in the toolbar
 
-### Option 2: Manual Installation
+## Setup
 
-1. Open Roblox Studio
-2. Create a new Script in `ServerStorage` (or your plugins folder)
-3. Copy the contents of each `.lua` file from `src/` into ModuleScripts:
-   - `src/init.server.lua` → Main plugin Script
-   - `src/MeshyAPI.lua` → ModuleScript child named "MeshyAPI"
-   - `src/OBJParser.lua` → ModuleScript child named "OBJParser"
-   - `src/UI.lua` → ModuleScript child named "UI"
-4. Save as a local plugin
+1. Click the **"Asset Generator"** button in the Meshy AI toolbar to open the plugin panel
+2. Paste your **Meshy API key** in the Settings section and click **Save**
 
-## Usage
+## Usage — 4-Step Workflow
 
-1. Click the **"Asset Generator"** button in the Meshy AI toolbar to open the panel
-2. Enter your Meshy API key in the Settings section and click **Save**
-3. **Step 1 - Generate Mesh:**
-   - Choose **Text Prompt** or **Image URL** input
-   - For text: describe the 3D object you want (e.g., "a medieval wooden chair")
-   - For image: paste a publicly accessible image URL
-   - Select an art style (Realistic, Cartoon, or Sculpture)
-   - Click **Generate Mesh** and wait for processing
-4. **Step 2 - Texture (Optional):**
-   - Choose text or image input for texture guidance
-   - Describe the desired texture or provide a reference image URL
-   - Click **Apply Texture**
-5. **Step 3 - Remesh (Optional):**
-   - Use the slider to set your target triangle count (1,000 - 20,000)
-   - Click **Remesh** to reduce polygon count for Roblox compatibility
-6. **Publish:**
-   - Click **Add to Workspace** to import the mesh into your game
-   - The mesh will appear near your camera position
-   - If auto-import fails, download links will be provided in the Output window
+### Step 1: Generate Mesh
+- Choose **Text Prompt** or **Image URL** as input
+- For text: describe the 3D object (e.g. "a medieval wooden chair")
+- For image: paste a publicly accessible image URL
+- Select an art style (Realistic, Cartoon, or Sculpture)
+- Click **Generate Mesh** and wait for processing
+- A preview mesh will appear in your workspace
 
-## Project Structure
+### Step 2: Texture
+- Choose text or image input for texture guidance
+- Describe the desired look or provide a reference image URL
+- Click **Apply Texture**
 
-```
-src/
-  init.server.lua   -- Main plugin entry point and orchestration
-  MeshyAPI.lua      -- Meshy REST API client (text-to-3d, image-to-3d, remesh, retexture)
-  OBJParser.lua     -- Wavefront OBJ format parser
-  UI.lua            -- Plugin GUI (dark theme, 3-step wizard)
-```
+### Step 3: Remesh
+- Use the slider to set a target triangle count (1,000–20,000)
+- Click **Remesh** to reduce polygon count for Roblox compatibility
+
+### Step 4: Publish
+- Click **Publish as Roblox Asset**
+- The plugin publishes both the mesh and texture as permanent Roblox assets via `AssetService:CreateAssetAsync`
+- A new `MeshPart` is created from the permanent asset IDs and inserted into the workspace
+- If publish fails, download links (GLB/FBX/OBJ) are shown in the Output window as a manual fallback
 
 ## Notes
 
+- The plugin is a single `.server.lua` file — no build step or Rojo required
 - Generated models are retained by Meshy for a maximum of 3 days
-- The plugin requires HTTP requests to be enabled (standard for Studio plugins)
-- Auto-import uses EditableMesh (beta) to parse OBJ files and create MeshParts programmatically
-- If EditableMesh is unavailable, the plugin provides direct download URLs for manual import via File > Import 3D
-- API credits are consumed per task (see [Meshy pricing](https://www.meshy.ai/api))
+- HTTP requests are enabled by default for Studio plugins
+- The plugin uses `EditableMesh` and `EditableImage` to handle mesh parsing and texture decoding
+- API credits are consumed per task — see [Meshy pricing](https://www.meshy.ai/api)
