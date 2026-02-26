@@ -347,11 +347,13 @@ function PNGDecoder.decode(pngData: string): (number, number, buffer?)
 
 	if width == 0 or height == 0 then return 0, 0, nil end
 
-	-- Limit to reasonable thumbnail sizes
-	if width > 1024 or height > 1024 then
-		warn("[Meshy AI] PNG too large for thumbnail: " .. width .. "x" .. height)
+	-- For thumbnails this limit prevents slow decodes; loadTextureImage passes large images
+	-- intentionally and handles the slow decode itself.
+	if width > 2048 or height > 2048 then
+		warn("[Meshy AI] PNG dimensions too large for Luau decode: " .. width .. "x" .. height .. " (max 2048)")
 		return width, height, nil
 	end
+	print("[Meshy AI] PNGDecoder: decoding " .. width .. "x" .. height .. " image")
 
 	-- Only support 8-bit RGB (type 2) and RGBA (type 6)
 	local channels
@@ -613,6 +615,13 @@ function MeshyAPI:pollTask(taskType: string, taskId: string, onProgress: ((numbe
 
 	error("Task timed out after polling " .. MAX_POLLS .. " times")
 end
+
+------------------------------------------------------------------------
+-- Forward declarations (defined later in Helpers; declared here so the
+-- UI class closures can reference them before their definitions)
+------------------------------------------------------------------------
+local loadThumbnailImage
+local loadTextureImage
 
 ------------------------------------------------------------------------
 -- UI
@@ -1021,8 +1030,29 @@ end
 function UI:_build()
 	local widget = self.widget
 
+	-- Root frame: holds tab bar + content panels
+	local root = Instance.new("Frame")
+	root.Name = "Root"
+	root.Size = UDim2.new(1, 0, 1, 0)
+	root.BackgroundColor3 = Theme.bg
+	root.BorderSizePixel = 0
+	root.Parent = widget
+
+	local TAB_H = 0  -- tab bar hidden; content fills full height
+
+	-- Content area (fills full widget)
+	local contentArea = Instance.new("Frame")
+	contentArea.Name = "Content"
+	contentArea.Size = UDim2.new(1, 0, 1, 0)
+	contentArea.Position = UDim2.new(0, 0, 0, 0)
+	contentArea.BackgroundColor3 = Theme.bg
+	contentArea.BorderSizePixel = 0
+	contentArea.ClipsDescendants = true
+	contentArea.Parent = root
+
+	-- Create tab scroll panel (existing content lives here)
 	local scroll = Instance.new("ScrollingFrame")
-	scroll.Name = "Root"
+	scroll.Name = "CreateScroll"
 	scroll.Size = UDim2.new(1, 0, 1, 0)
 	scroll.BackgroundColor3 = Theme.bg
 	scroll.BorderSizePixel = 0
@@ -1030,7 +1060,23 @@ function UI:_build()
 	scroll.ScrollBarImageColor3 = Theme.textMuted
 	scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 	scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-	scroll.Parent = widget
+	scroll.Parent = contentArea
+	self._createScroll = scroll
+
+	-- History tab scroll panel
+	local historyScroll = Instance.new("ScrollingFrame")
+	historyScroll.Name = "HistoryScroll"
+	historyScroll.Size = UDim2.new(1, 0, 1, 0)
+	historyScroll.BackgroundColor3 = Theme.bg
+	historyScroll.BorderSizePixel = 0
+	historyScroll.ScrollBarThickness = 6
+	historyScroll.ScrollBarImageColor3 = Theme.textMuted
+	historyScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	historyScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	historyScroll.Visible = false
+	historyScroll.Parent = contentArea
+	self._historyScroll = historyScroll
+
 
 	local layout = Instance.new("UIListLayout")
 	layout.Padding = UDim.new(0, SPACING)
@@ -1648,6 +1694,9 @@ function UI:_build()
 	self:_setStepEnabled(2, false)
 	self:_setStepEnabled(3, false)
 	self:_setPublishEnabled(false)
+
+	-- Build history tab skeleton
+	self:_buildHistoryTab()
 end
 
 function UI:_updateGenInputVisibility(option: string)
@@ -1715,14 +1764,14 @@ function UI:setThumbnail(url: string)
 				return
 			end
 
-			-- Publish the EditableImage as a Decal to get a real asset ID
-			local pubOk, pubRetA, pubRetB = pcall(function()
-				return AssetService:CreateAssetAsync(
-					editableImage,
-					Enum.AssetType.Decal,
-					{ Name = "Meshy AI Preview" }
-				)
-			end)
+		-- Publish the EditableImage as an Image to get a real asset ID
+		local pubOk, pubRetA, pubRetB = pcall(function()
+			return AssetService:CreateAssetAsync(
+				editableImage,
+				Enum.AssetType.Image,
+				{ Name = "Meshy AI Preview" }
+			)
+		end)
 
 			if not pubOk then
 				warn("[Meshy AI] Thumbnail publish failed: " .. tostring(pubRetA))
@@ -1807,6 +1856,303 @@ function UI:setButtonEnabled(btn, enabled)
 end
 
 ------------------------------------------------------------------------
+-- History Tab UI
+------------------------------------------------------------------------
+
+-- Build the static skeleton of the history tab (called once from _build).
+function UI:_buildHistoryTab()
+	local scroll = self._historyScroll
+	addPadding(scroll, PADDING, PADDING, PADDING, PADDING)
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, SPACING)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = scroll
+
+	-- Header row: title + Clear button
+	local headerFrame = Instance.new("Frame")
+	headerFrame.Name = "HistoryHeader"
+	headerFrame.Size = UDim2.new(1, 0, 0, 28)
+	headerFrame.BackgroundTransparency = 1
+	headerFrame.LayoutOrder = 1
+	headerFrame.Parent = scroll
+
+	local headerLabel = Instance.new("TextLabel")
+	headerLabel.Size = UDim2.new(1, -70, 1, 0)
+	headerLabel.BackgroundTransparency = 1
+	headerLabel.Font = FONT_BOLD
+	headerLabel.TextColor3 = Theme.heading
+	headerLabel.TextSize = 15
+	headerLabel.Text = "Generation History"
+	headerLabel.TextXAlignment = Enum.TextXAlignment.Left
+	headerLabel.Parent = headerFrame
+
+	local clearBtn = Instance.new("TextButton")
+	clearBtn.Name = "ClearBtn"
+	clearBtn.Size = UDim2.new(0, 60, 1, 0)
+	clearBtn.Position = UDim2.new(1, -60, 0, 0)
+	clearBtn.BackgroundColor3 = Theme.error
+	clearBtn.Font = FONT
+	clearBtn.TextColor3 = Color3.new(1, 1, 1)
+	clearBtn.TextSize = 12
+	clearBtn.Text = "Clear All"
+	clearBtn.AutoButtonColor = true
+	clearBtn.Parent = headerFrame
+	addCorner(clearBtn)
+	clearBtn.Activated:Connect(function()
+		if self.callbacks.onClearHistory then
+			self.callbacks.onClearHistory()
+		end
+	end)
+
+	-- Empty state placeholder
+	local emptyLabel = Instance.new("TextLabel")
+	emptyLabel.Name = "EmptyLabel"
+	emptyLabel.Size = UDim2.new(1, 0, 0, 60)
+	emptyLabel.BackgroundTransparency = 1
+	emptyLabel.Font = FONT
+	emptyLabel.TextColor3 = Theme.textMuted
+	emptyLabel.TextSize = 13
+	emptyLabel.Text = "No history yet.\nGenerate a mesh to get started."
+	emptyLabel.TextXAlignment = Enum.TextXAlignment.Center
+	emptyLabel.TextWrapped = true
+	emptyLabel.AutomaticSize = Enum.AutomaticSize.Y
+	emptyLabel.LayoutOrder = 2
+	emptyLabel.Parent = scroll
+	self._historyEmptyLabel = emptyLabel
+
+	-- Container for entry cards (entries prepended above this)
+	self._historyEntriesContainer = scroll
+	self._historyLayout = layout
+	self._historyEntryCount = 0
+end
+
+-- Format a Unix timestamp as "MMM DD HH:MM"
+local function formatTimestamp(ts)
+	return os.date("%b %d %H:%M", ts)
+end
+
+-- Truncate a string to maxLen with ellipsis
+local function truncate(s, maxLen)
+	if not s or s == "" then return "" end
+	if #s <= maxLen then return s end
+	return s:sub(1, maxLen - 3) .. "..."
+end
+
+-- Render one history entry card and add it to the history scroll.
+-- layoutOrder determines position (lower = higher on screen = newer).
+function UI:_renderHistoryCard(entry, layoutOrder)
+	local scroll = self._historyEntriesContainer
+
+	local card = Instance.new("Frame")
+	card.Name = "HistoryEntry_" .. tostring(layoutOrder)
+	card.Size = UDim2.new(1, 0, 0, 0)
+	card.AutomaticSize = Enum.AutomaticSize.Y
+	card.BackgroundColor3 = Theme.panel
+	card.LayoutOrder = layoutOrder
+	card.Parent = scroll
+	addCorner(card)
+	addBorder(card, Theme.divider)
+
+	local cardLayout = Instance.new("UIListLayout")
+	cardLayout.Padding = UDim.new(0, 4)
+	cardLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	cardLayout.Parent = card
+	addPadding(card, 8, 8, 10, 10)
+
+	local co = 0
+	local function nextCo() co = co + 1 return co end
+
+	-- Row 1: task type badge + timestamp
+	local row1 = Instance.new("Frame")
+	row1.Size = UDim2.new(1, 0, 0, 18)
+	row1.BackgroundTransparency = 1
+	row1.LayoutOrder = nextCo()
+	row1.Parent = card
+
+	local badge = Instance.new("TextLabel")
+	badge.Size = UDim2.new(0, 90, 1, 0)
+	badge.BackgroundColor3 = Theme.primary
+	badge.Font = FONT_BOLD
+	badge.TextColor3 = Color3.new(1, 1, 1)
+	badge.TextSize = 10
+	badge.Text = entry.taskType or "unknown"
+	badge.TextXAlignment = Enum.TextXAlignment.Center
+	badge.Parent = row1
+	addCorner(badge, UDim.new(0, 3))
+
+	local tsLabel = Instance.new("TextLabel")
+	tsLabel.Size = UDim2.new(1, -96, 1, 0)
+	tsLabel.Position = UDim2.new(0, 96, 0, 0)
+	tsLabel.BackgroundTransparency = 1
+	tsLabel.Font = FONT
+	tsLabel.TextColor3 = Theme.textMuted
+	tsLabel.TextSize = 11
+	tsLabel.Text = formatTimestamp(entry.timestamp or 0)
+	tsLabel.TextXAlignment = Enum.TextXAlignment.Right
+	tsLabel.Parent = row1
+
+	-- Row 2: prompt text
+	if entry.prompt and entry.prompt ~= "" then
+		local promptLabel = Instance.new("TextLabel")
+		promptLabel.Size = UDim2.new(1, 0, 0, 0)
+		promptLabel.AutomaticSize = Enum.AutomaticSize.Y
+		promptLabel.BackgroundTransparency = 1
+		promptLabel.Font = FONT
+		promptLabel.TextColor3 = Theme.text
+		promptLabel.TextSize = 12
+		promptLabel.Text = truncate(entry.prompt, 80)
+		promptLabel.TextXAlignment = Enum.TextXAlignment.Left
+		promptLabel.TextWrapped = true
+		promptLabel.LayoutOrder = nextCo()
+		promptLabel.Parent = card
+	end
+
+	-- Helper: copyable URL row
+	local function addUrlRow(label, url)
+		if not url or url == "" then return end
+		local rowFrame = Instance.new("Frame")
+		rowFrame.Size = UDim2.new(1, 0, 0, 0)
+		rowFrame.AutomaticSize = Enum.AutomaticSize.Y
+		rowFrame.BackgroundTransparency = 1
+		rowFrame.LayoutOrder = nextCo()
+		rowFrame.Parent = card
+
+		local rowLayout = Instance.new("UIListLayout")
+		rowLayout.FillDirection = Enum.FillDirection.Vertical
+		rowLayout.Padding = UDim.new(0, 2)
+		rowLayout.Parent = rowFrame
+
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.new(1, 0, 0, 13)
+		lbl.BackgroundTransparency = 1
+		lbl.Font = FONT
+		lbl.TextColor3 = Theme.textMuted
+		lbl.TextSize = 10
+		lbl.Text = label
+		lbl.TextXAlignment = Enum.TextXAlignment.Left
+		lbl.Parent = rowFrame
+
+		local box = Instance.new("TextBox")
+		box.Size = UDim2.new(1, 0, 0, 22)
+		box.BackgroundColor3 = Theme.input
+		box.Font = FONT
+		box.TextColor3 = Theme.primary
+		box.TextSize = 10
+		box.Text = url
+		box.TextXAlignment = Enum.TextXAlignment.Left
+		box.TextWrapped = false
+		box.ClearTextOnFocus = false
+		box.TextEditable = false
+		box.ClipsDescendants = true
+		box.Parent = rowFrame
+		addCorner(box, UDim.new(0, 3))
+		addPadding(box, 3, 3, 6, 6)
+	end
+
+	-- Thumbnail URL
+	if entry.thumbnailUrl and entry.thumbnailUrl ~= "" then
+		addUrlRow("Thumbnail", entry.thumbnailUrl)
+	end
+
+	-- Model URLs
+	if entry.modelUrls then
+		if entry.modelUrls.obj and entry.modelUrls.obj ~= "" then
+			addUrlRow("OBJ", entry.modelUrls.obj)
+		end
+		if entry.modelUrls.glb and entry.modelUrls.glb ~= "" then
+			addUrlRow("GLB", entry.modelUrls.glb)
+		end
+		if entry.modelUrls.fbx and entry.modelUrls.fbx ~= "" then
+			addUrlRow("FBX", entry.modelUrls.fbx)
+		end
+	end
+
+	-- Action buttons row: Load + Delete
+	local btnRow = Instance.new("Frame")
+	btnRow.Size = UDim2.new(1, 0, 0, 30)
+	btnRow.BackgroundTransparency = 1
+	btnRow.LayoutOrder = nextCo()
+	btnRow.Parent = card
+
+	local btnRowLayout = Instance.new("UIListLayout")
+	btnRowLayout.FillDirection = Enum.FillDirection.Horizontal
+	btnRowLayout.Padding = UDim.new(0, 6)
+	btnRowLayout.Parent = btnRow
+
+	local loadBtn = Instance.new("TextButton")
+	loadBtn.Name = "LoadBtn"
+	loadBtn.Size = UDim2.new(0.6, -3, 1, 0)
+	loadBtn.BackgroundColor3 = Theme.primary
+	loadBtn.Font = FONT_BOLD
+	loadBtn.TextColor3 = Color3.new(1, 1, 1)
+	loadBtn.TextSize = 12
+	loadBtn.Text = "Load into Workspace"
+	loadBtn.AutoButtonColor = true
+	loadBtn.Parent = btnRow
+	addCorner(loadBtn)
+
+	local deleteBtn = Instance.new("TextButton")
+	deleteBtn.Name = "DeleteBtn"
+	deleteBtn.Size = UDim2.new(0.4, -3, 1, 0)
+	deleteBtn.BackgroundColor3 = Theme.error
+	deleteBtn.Font = FONT
+	deleteBtn.TextColor3 = Color3.new(1, 1, 1)
+	deleteBtn.TextSize = 12
+	deleteBtn.Text = "Delete"
+	deleteBtn.AutoButtonColor = true
+	deleteBtn.Parent = btnRow
+	addCorner(deleteBtn)
+
+	loadBtn.Activated:Connect(function()
+		if self.callbacks.onLoadHistory then
+			self.callbacks.onLoadHistory(entry)
+		end
+	end)
+
+	deleteBtn.Activated:Connect(function()
+		if self.callbacks.onDeleteHistory then
+			self.callbacks.onDeleteHistory(entry)
+		end
+	end)
+
+	return card
+end
+
+-- Fully rebuild the history list from the provided entries array.
+function UI:refreshHistory(entries)
+	local scroll = self._historyEntriesContainer
+	if not scroll then return end
+
+	-- Remove all existing entry cards
+	for _, child in ipairs(scroll:GetChildren()) do
+		if child.Name:match("^HistoryEntry_") then
+			child:Destroy()
+		end
+	end
+
+	self._historyEntryCount = #entries
+
+	if #entries == 0 then
+		if self._historyEmptyLabel then
+			self._historyEmptyLabel.Visible = true
+		end
+		return
+	end
+
+	if self._historyEmptyLabel then
+		self._historyEmptyLabel.Visible = false
+	end
+
+	-- Render entries; newest first (index 1 = newest), use high layout order
+	-- so they appear below the header (LayoutOrder 1) and above emptyLabel (2).
+	-- We assign layout orders starting at 1000 downward so newest = lowest order = top.
+	for i, entry in ipairs(entries) do
+		self:_renderHistoryCard(entry, 1000 + i)
+	end
+end
+
+------------------------------------------------------------------------
 -- Plugin Setup
 ------------------------------------------------------------------------
 local toolbar = plugin:CreateToolbar("Meshy AI")
@@ -1836,6 +2182,7 @@ local state = {
 	currentTaskId = nil,
 	currentTaskType = nil,
 	sourceType = nil,
+	originalPreviewTaskId = nil,
 	modelUrls = nil,
 	textureUrls = nil,
 	thumbnailUrl = nil,
@@ -1843,6 +2190,7 @@ local state = {
 	-- Preview mesh (shown in workspace after generation)
 	previewMeshPart = nil,
 	previewEditableMesh = nil,
+	previewEditableImage = nil,
 }
 
 ------------------------------------------------------------------------
@@ -1888,6 +2236,42 @@ loadApiKey()
 loadRobloxSettings()
 
 ------------------------------------------------------------------------
+-- History: data, persistence, helpers
+-- NOTE: loadHistory() and ui:refreshHistory() are called after the
+-- history helpers are defined (see "Startup: load history" below).
+------------------------------------------------------------------------
+local MAX_HISTORY = 50
+local history = {}  -- array, index 1 = newest
+
+local function saveHistory()
+	local ok, encoded = pcall(HttpService.JSONEncode, HttpService, history)
+	if ok then
+		plugin:SetSetting("MeshyHistory", encoded)
+	else
+		warn("[Meshy AI] Failed to save history: " .. tostring(encoded))
+	end
+end
+
+local function loadHistory()
+	local raw = plugin:GetSetting("MeshyHistory")
+	if raw and raw ~= "" then
+		local ok, decoded = pcall(HttpService.JSONDecode, HttpService, raw)
+		if ok and type(decoded) == "table" then
+			history = decoded
+		end
+	end
+end
+
+local function addHistoryEntry(entry)
+	table.insert(history, 1, entry)   -- newest first
+	while #history > MAX_HISTORY do
+		table.remove(history)          -- drop oldest
+	end
+	saveHistory()
+	ui:refreshHistory(history)
+end
+
+------------------------------------------------------------------------
 -- Helpers
 ------------------------------------------------------------------------
 local function setBusy(busy)
@@ -1909,8 +2293,80 @@ local function downloadText(url: string): string
 	return response.Body
 end
 
+-- Shallow-dump a table's key=value pairs for debugging
+local function dumpTable(t, label)
+	if type(t) ~= "table" then
+		print("[Meshy AI] " .. label .. " = " .. tostring(t) .. " (type=" .. type(t) .. ")")
+		return
+	end
+	local parts = {}
+	for k, v in pairs(t) do
+		if type(v) == "table" then
+			local innerParts = {}
+			for ik, iv in pairs(v) do
+				table.insert(innerParts, tostring(ik) .. "=" .. tostring(iv):sub(1, 80))
+			end
+			table.insert(parts, tostring(k) .. "={" .. table.concat(innerParts, ", ") .. "}")
+		else
+			table.insert(parts, tostring(k) .. "=" .. tostring(v):sub(1, 80))
+		end
+	end
+	print("[Meshy AI] " .. label .. ": { " .. table.concat(parts, " | ") .. " }")
+end
+
+-- Resolve the best texture URL from state.textureUrls.
+-- The Meshy API returns texture_urls as an ARRAY of texture-set objects:
+--   { [1] = { base_color="url", normal="url", metallic="url", ... }, ... }
+-- but older calls may return a flat dict { base_color="url", ... }.
+-- Both formats are handled here.
+local function getTextureUrl(): string?
+	if not state.textureUrls then
+		print("[Meshy AI] getTextureUrl: textureUrls is nil")
+		return nil
+	end
+
+	-- Search a single texture-set dict for a usable base-color URL
+	local PREFERRED_KEYS = {"base_color", "basecolor", "baseColor", "diffuse", "albedo"}
+	local function findInDict(t)
+		if type(t) ~= "table" then return nil end
+		for _, key in ipairs(PREFERRED_KEYS) do
+			if type(t[key]) == "string" and t[key] ~= "" then
+				print("[Meshy AI] getTextureUrl: matched key '" .. key .. "'")
+				return t[key]
+			end
+		end
+		-- Fallback: first string value that looks like a URL
+		for k, v in pairs(t) do
+			if type(v) == "string" and v ~= "" and v:match("^https?://") then
+				print("[Meshy AI] getTextureUrl: fallback key '" .. tostring(k) .. "'")
+				return v
+			end
+		end
+		return nil
+	end
+
+	-- Array-of-objects format: { [1] = { base_color="url", ... }, ... }
+	if type(state.textureUrls[1]) == "table" then
+		print("[Meshy AI] getTextureUrl: array format, " .. #state.textureUrls .. " texture set(s)")
+		for _, texSet in ipairs(state.textureUrls) do
+			local url = findInDict(texSet)
+			if url then return url end
+		end
+		print("[Meshy AI] getTextureUrl: no URL found in array")
+		return nil
+	end
+
+	-- Flat-dict format: { base_color="url", ... }
+	print("[Meshy AI] getTextureUrl: flat dict format")
+	local url = findInDict(state.textureUrls)
+	if not url then
+		print("[Meshy AI] getTextureUrl: no URL found in flat dict")
+	end
+	return url
+end
+
 -- Download a thumbnail URL and return an EditableImage (or nil on failure)
-local function loadThumbnailImage(url: string): any?
+loadThumbnailImage = function(url: string): any?
 	local ok, response = pcall(function()
 		return HttpService:RequestAsync({ Url = url, Method = "GET" })
 	end)
@@ -1965,6 +2421,96 @@ local function loadThumbnailImage(url: string): any?
 	end
 
 	print("[Meshy AI] Thumbnail decoded: " .. w .. "x" .. h)
+	return editableImage
+end
+
+-- Download a full-resolution texture and return an EditableImage.
+-- Unlike loadThumbnailImage, this has no file-size limit so it works
+-- with the 1-4 MB PNGs that Meshy AI returns for textures.
+-- Nearest-neighbor downsampler for RGBA pixel buffers.
+-- Returns a new buffer scaled to (dstW x dstH).
+local function downsampleBuffer(srcBuf, srcW, srcH, dstW, dstH)
+	local dstBuf = buffer.create(dstW * dstH * 4)
+	local scaleX = srcW / dstW
+	local scaleY = srcH / dstH
+	for y = 0, dstH - 1 do
+		for x = 0, dstW - 1 do
+			local srcX = math.floor(x * scaleX)
+			local srcY = math.floor(y * scaleY)
+			local srcOff = (srcY * srcW + srcX) * 4
+			local dstOff = (y * dstW + x) * 4
+			buffer.writeu8(dstBuf, dstOff,     buffer.readu8(srcBuf, srcOff))
+			buffer.writeu8(dstBuf, dstOff + 1, buffer.readu8(srcBuf, srcOff + 1))
+			buffer.writeu8(dstBuf, dstOff + 2, buffer.readu8(srcBuf, srcOff + 2))
+			buffer.writeu8(dstBuf, dstOff + 3, buffer.readu8(srcBuf, srcOff + 3))
+		end
+	end
+	return dstBuf
+end
+
+local MAX_EDITABLE_IMAGE_SIZE = 1024
+
+loadTextureImage = function(url: string): any?
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync({ Url = url, Method = "GET" })
+	end)
+
+	if not ok or not response or response.StatusCode ~= 200 then
+		warn("[Meshy AI] Failed to download texture: " .. tostring(ok and response and response.StatusCode or response))
+		return nil
+	end
+
+	local pngData = response.Body
+	print("[Meshy AI] Texture downloaded: " .. tostring(#pngData) .. " bytes")
+
+	if #pngData < 8 or string.byte(pngData, 1) ~= 137 then
+		warn("[Meshy AI] Texture is not PNG format (byte 1 = " .. tostring(string.byte(pngData, 1)) .. "), cannot decode")
+		return nil
+	end
+
+	print("[Meshy AI] Decoding texture PNG (this may take a moment for large images)...")
+	local decOk, w, h, pixelBuf = pcall(PNGDecoder.decode, pngData)
+	if not decOk then
+		warn("[Meshy AI] Texture PNG decode error: " .. tostring(w))
+		return nil
+	end
+
+	if not pixelBuf or w == 0 or h == 0 then
+		warn("[Meshy AI] Texture PNG decode returned no pixel data (" .. tostring(w) .. "x" .. tostring(h) .. ")")
+		return nil
+	end
+
+	print("[Meshy AI] Texture decoded: " .. w .. "x" .. h)
+
+	-- Roblox EditableImage is capped at 1024x1024; downsample if needed.
+	if w > MAX_EDITABLE_IMAGE_SIZE or h > MAX_EDITABLE_IMAGE_SIZE then
+		local scale = math.min(MAX_EDITABLE_IMAGE_SIZE / w, MAX_EDITABLE_IMAGE_SIZE / h)
+		local newW = math.max(1, math.floor(w * scale))
+		local newH = math.max(1, math.floor(h * scale))
+		print("[Meshy AI] Downsampling texture " .. w .. "x" .. h .. " → " .. newW .. "x" .. newH)
+		pixelBuf = downsampleBuffer(pixelBuf, w, h, newW, newH)
+		w, h = newW, newH
+	end
+
+	local imgOk, editableImage = pcall(function()
+		return AssetService:CreateEditableImage({ Size = Vector2.new(w, h) })
+	end)
+
+	if not imgOk or not editableImage then
+		warn("[Meshy AI] Failed to create EditableImage for texture: " .. tostring(editableImage))
+		return nil
+	end
+
+	local writeOk, writeErr = pcall(function()
+		editableImage:WritePixelsBuffer(Vector2.new(0, 0), Vector2.new(w, h), pixelBuf)
+	end)
+
+	if not writeOk then
+		warn("[Meshy AI] Texture WritePixelsBuffer failed: " .. tostring(writeErr))
+		return nil
+	end
+
+	print("[Meshy AI] Texture EditableImage created: " .. w .. "x" .. h)
 	return editableImage
 end
 
@@ -2091,8 +2637,12 @@ local function importPreview(modelUrls)
 	if state.previewEditableMesh then
 		pcall(function() state.previewEditableMesh:Destroy() end)
 	end
+	if state.previewEditableImage then
+		pcall(function() state.previewEditableImage:Destroy() end)
+	end
 	state.previewMeshPart = nil
 	state.previewEditableMesh = nil
+	state.previewEditableImage = nil
 
 	-- Download and parse OBJ
 	print("[Meshy AI] Downloading OBJ...")
@@ -2125,6 +2675,30 @@ local function importPreview(modelUrls)
 	else
 		warn("[Meshy AI] 3D preview failed (CreateMeshPartAsync): " .. tostring(meshPartResult))
 		warn("[Meshy AI] EditableMesh is saved — Publish should still work")
+	end
+
+	-- Load texture and apply to preview MeshPart
+	local textureUrl = getTextureUrl()
+	if textureUrl then
+		print("[Meshy AI] Loading texture for preview...")
+		local texOk, texResult = pcall(loadTextureImage, textureUrl)
+		if texOk and texResult then
+			state.previewEditableImage = texResult
+			if state.previewMeshPart then
+				local applyOk, applyErr = pcall(function()
+					state.previewMeshPart.TextureContent = Content.fromObject(texResult)
+				end)
+				if applyOk then
+					print("[Meshy AI] Texture applied to preview MeshPart")
+				else
+					warn("[Meshy AI] Could not apply texture to preview: " .. tostring(applyErr))
+				end
+			end
+		else
+			warn("[Meshy AI] Failed to load preview texture: " .. tostring(texResult))
+		end
+	else
+		print("[Meshy AI] No texture URL available for preview")
 	end
 
 	return triCount
@@ -2321,9 +2895,18 @@ ui.callbacks.onGenerate = function(inputType, prompt, artStyle)
 				ui:setGenStatus("Generating mesh... " .. tostring(progress) .. "%")
 			end)
 
+			-- DEBUG: dump full API result to see exact field names
+			print("[Meshy AI] ===== onGenerate pollTask result =====")
+			dumpTable(result, "result (top-level keys)")
+			dumpTable(result.model_urls, "result.model_urls")
+			dumpTable(result.texture_urls, "result.texture_urls")
+			print("[Meshy AI] result.thumbnail_url = " .. tostring(result.thumbnail_url))
+			print("[Meshy AI] ==========================================")
+
 			state.currentTaskId = taskId
 			state.currentTaskType = taskType
 			state.sourceType = taskType
+			state.originalPreviewTaskId = taskId
 			state.modelUrls = result.model_urls
 			state.textureUrls = result.texture_urls
 			state.thumbnailUrl = result.thumbnail_url
@@ -2353,6 +2936,19 @@ ui.callbacks.onGenerate = function(inputType, prompt, artStyle)
 			ui:enableStep(2)
 			ui:enableStep(3)
 			ui:enablePublish()
+
+			addHistoryEntry({
+				timestamp = os.time(),
+				prompt = prompt,
+				inputType = inputType,
+				taskType = taskType,
+				taskId = taskId,
+				sourceType = taskType,
+				originalPreviewTaskId = taskId,
+				thumbnailUrl = result.thumbnail_url or "",
+				modelUrls = result.model_urls,
+				textureUrls = result.texture_urls,
+			})
 		end)
 
 		if not success then
@@ -2393,7 +2989,7 @@ ui.callbacks.onTexture = function(inputType, prompt)
 				local textureImageUrl = inputType == "image" and prompt or nil
 
 				ui:setTexStatus("Submitting texture refine task...")
-				taskId = api:textTo3DRefine(state.currentTaskId, texturePrompt, textureImageUrl)
+				taskId = api:textTo3DRefine(state.originalPreviewTaskId, texturePrompt, textureImageUrl)
 			else
 				taskType = "retexture"
 				local textStylePrompt = inputType == "text" and prompt or nil
@@ -2409,6 +3005,14 @@ ui.callbacks.onTexture = function(inputType, prompt)
 				ui:setTexProgress(progress)
 				ui:setTexStatus("Applying texture... " .. tostring(progress) .. "%")
 			end)
+
+			-- DEBUG: dump full API result to see exact field names
+			print("[Meshy AI] ===== onTexture pollTask result =====")
+			dumpTable(result, "result (top-level keys)")
+			dumpTable(result.model_urls, "result.model_urls")
+			dumpTable(result.texture_urls, "result.texture_urls")
+			print("[Meshy AI] result.thumbnail_url = " .. tostring(result.thumbnail_url))
+			print("[Meshy AI] ==========================================")
 
 			state.currentTaskId = taskId
 			state.currentTaskType = taskType
@@ -2433,6 +3037,19 @@ ui.callbacks.onTexture = function(inputType, prompt)
 					warn("[Meshy AI] Texture preview error: " .. tostring(previewErr))
 				end
 			end
+
+			addHistoryEntry({
+				timestamp = os.time(),
+				prompt = prompt,
+				inputType = inputType,
+				taskType = taskType,
+				taskId = taskId,
+				sourceType = state.sourceType,
+				originalPreviewTaskId = state.originalPreviewTaskId,
+				thumbnailUrl = state.thumbnailUrl or "",
+				modelUrls = result.model_urls,
+				textureUrls = result.texture_urls,
+			})
 		end)
 
 		if not success then
@@ -2470,8 +3087,16 @@ ui.callbacks.onRemesh = function(targetPolycount)
 				ui:setRemeshStatus("Remeshing... " .. tostring(progress) .. "%")
 			end)
 
+			-- DEBUG: dump full API result to see exact field names
+			print("[Meshy AI] ===== onRemesh pollTask result =====")
+			dumpTable(result, "result (top-level keys)")
+			dumpTable(result.model_urls, "result.model_urls")
+			dumpTable(result.texture_urls, "result.texture_urls")
+			print("[Meshy AI] ==========================================")
+
 			state.currentTaskId = taskId
 			state.currentTaskType = "remesh"
+			state.sourceType = "remesh"
 			state.modelUrls = result.model_urls
 			if result.texture_urls then
 				state.textureUrls = result.texture_urls
@@ -2500,6 +3125,19 @@ ui.callbacks.onRemesh = function(targetPolycount)
 					warn("[Meshy AI] Remesh preview error: " .. tostring(previewErr))
 				end
 			end
+
+			addHistoryEntry({
+				timestamp = os.time(),
+				prompt = "Remesh (" .. tostring(targetPolycount) .. " tris)",
+				inputType = "remesh",
+				taskType = "remesh",
+				taskId = taskId,
+				sourceType = "remesh",
+				originalPreviewTaskId = state.originalPreviewTaskId,
+				thumbnailUrl = state.thumbnailUrl or "",
+				modelUrls = result.model_urls,
+				textureUrls = state.textureUrls,
+			})
 		end)
 
 		if not success then
@@ -2528,6 +3166,23 @@ ui.callbacks.onPublish = function()
 	task.spawn(function()
 		local success, err = pcall(function()
 			------------------------------------------------------------
+			-- DEBUG: State snapshot at publish start
+			------------------------------------------------------------
+			print("[Meshy AI] ========== PUBLISH START ==========")
+			print("[Meshy AI] state.previewEditableMesh = " .. tostring(state.previewEditableMesh))
+			print("[Meshy AI] state.previewEditableImage = " .. tostring(state.previewEditableImage))
+			print("[Meshy AI] state.textureUrls = " .. tostring(state.textureUrls))
+			if state.textureUrls then
+				local texKeys = {}
+				for k, v in pairs(state.textureUrls) do
+					table.insert(texKeys, k .. "=" .. tostring(v):sub(1, 60))
+				end
+				print("[Meshy AI] textureUrls contents: " .. table.concat(texKeys, " | "))
+			end
+			print("[Meshy AI] state.modelUrls = " .. tostring(state.modelUrls))
+			print("[Meshy AI] =====================================")
+
+			------------------------------------------------------------
 			-- A. Get or create the EditableMesh
 			------------------------------------------------------------
 			local editableMesh = state.previewEditableMesh
@@ -2548,61 +3203,38 @@ ui.callbacks.onPublish = function()
 			end
 
 			------------------------------------------------------------
-			-- B. Download and decode texture into EditableImage
+			-- B. Get or create the EditableImage for texture
 			------------------------------------------------------------
-			local editableImage = nil
-			local textureUrl = nil
+			print("[Meshy AI] --- Section B: Texture Resolution ---")
+			local editableImage = state.previewEditableImage
 
-			if state.textureUrls then
-				-- Log all available texture keys for debugging
-				local texKeys = {}
-				for k, v in pairs(state.textureUrls) do
-					table.insert(texKeys, k .. "=" .. tostring(v):sub(1, 60))
-				end
-				print("[Meshy AI] Available texture URLs: " .. table.concat(texKeys, " | "))
-
-				-- Try known key names for the diffuse/base color texture
-				for _, key in ipairs({"base_color", "basecolor", "baseColor", "diffuse", "albedo"}) do
-					if state.textureUrls[key] and state.textureUrls[key] ~= "" then
-						textureUrl = state.textureUrls[key]
-						print("[Meshy AI] Using texture key: " .. key)
-						break
-					end
-				end
-
-				-- Fallback: use the first available URL
-				if not textureUrl then
-					for k, v in pairs(state.textureUrls) do
-						if type(v) == "string" and v ~= "" and v:match("^https?://") then
-							textureUrl = v
-							print("[Meshy AI] Using fallback texture key: " .. k)
-							break
-						end
-					end
-				end
+			if editableImage then
+				print("[Meshy AI] B: Reusing cached EditableImage from preview (skipping download)")
 			else
-				print("[Meshy AI] state.textureUrls is nil")
-			end
+				print("[Meshy AI] B: No cached EditableImage — attempting to resolve texture URL")
+				local textureUrl = getTextureUrl()
+				print("[Meshy AI] B: getTextureUrl() returned: " .. tostring(textureUrl))
 
-			if textureUrl and textureUrl ~= "" then
-				ui:setPubProgress(15)
-				ui:setPubStatus("Downloading texture...")
-				print("[Meshy AI] Downloading texture from: " .. textureUrl:sub(1, 80))
+				if textureUrl and textureUrl ~= "" then
+					ui:setPubProgress(15)
+					ui:setPubStatus("Downloading texture...")
+					print("[Meshy AI] B: Downloading texture from: " .. textureUrl:sub(1, 80))
 
-				local texOk, texResult = pcall(function()
-					return loadThumbnailImage(textureUrl) -- reuse PNG download+decode
-				end)
+					local texOk, texResult = pcall(loadTextureImage, textureUrl)
+					print("[Meshy AI] B: loadTextureImage pcall ok=" .. tostring(texOk) .. " result=" .. tostring(texResult))
 
-				if texOk and texResult then
-					editableImage = texResult
-					print("[Meshy AI] Texture loaded for publishing")
+					if texOk and texResult then
+						editableImage = texResult
+						print("[Meshy AI] B: Texture EditableImage created successfully")
+					else
+						warn("[Meshy AI] B: Texture download/decode FAILED: " .. tostring(texResult))
+						warn("[Meshy AI] B: Will publish mesh without texture")
+					end
 				else
-					warn("[Meshy AI] Texture download/decode failed: " .. tostring(texResult))
-					warn("[Meshy AI] Will publish mesh without texture")
+					print("[Meshy AI] B: No texture URL found — publishing mesh only")
 				end
-			else
-				print("[Meshy AI] No texture URL found — publishing mesh only")
 			end
+			print("[Meshy AI] B: editableImage going into publish = " .. tostring(editableImage))
 
 			------------------------------------------------------------
 			-- C. Publish EditableMesh as permanent Mesh asset
@@ -2638,40 +3270,56 @@ ui.callbacks.onPublish = function()
 			------------------------------------------------------------
 			-- D. Publish EditableImage as permanent Decal asset
 			------------------------------------------------------------
+			print("[Meshy AI] --- Section D: Texture Publish ---")
 			local textureAssetId = nil
 
 			if editableImage then
-				ui:setPubProgress(50)
-				ui:setPubStatus("Publishing texture to Roblox...")
+			print("[Meshy AI] D: editableImage is valid — calling CreateAssetAsync(Image)")
+			ui:setPubProgress(50)
+			ui:setPubStatus("Publishing texture to Roblox...")
 
-				local texPubOk, texRetA, texRetB = pcall(function()
-					return AssetService:CreateAssetAsync(
-						editableImage,
-						Enum.AssetType.Decal,
-						{ Name = "Meshy AI Texture" }
-					)
-				end)
+			local texPubOk, texRetA, texRetB = pcall(function()
+				return AssetService:CreateAssetAsync(
+					editableImage,
+					Enum.AssetType.Image,
+					{ Name = "Meshy AI Texture" }
+				)
+			end)
 
-				print("[Meshy AI] Texture CreateAssetAsync returned: ok=" .. tostring(texPubOk) .. ", " .. tostring(texRetA) .. ", " .. tostring(texRetB))
+				print("[Meshy AI] D: CreateAssetAsync pcall ok=" .. tostring(texPubOk))
+				print("[Meshy AI] D: retA = " .. tostring(texRetA) .. " (type=" .. type(texRetA) .. ")")
+				print("[Meshy AI] D: retB = " .. tostring(texRetB) .. " (type=" .. type(texRetB) .. ")")
 
 				if texPubOk then
-					-- Same flexible extraction as mesh
 					if type(texRetB) == "number" and texRetB > 0 then
 						textureAssetId = texRetB
+						print("[Meshy AI] D: Got asset ID from retB: " .. tostring(textureAssetId))
 					elseif type(texRetA) == "number" and texRetA > 0 then
 						textureAssetId = texRetA
+						print("[Meshy AI] D: Got asset ID from retA: " .. tostring(textureAssetId))
+					else
+						warn("[Meshy AI] D: CreateAssetAsync succeeded but no numeric asset ID found!")
+						warn("[Meshy AI] D: retA type=" .. type(texRetA) .. " value=" .. tostring(texRetA))
+						warn("[Meshy AI] D: retB type=" .. type(texRetB) .. " value=" .. tostring(texRetB))
+						-- Try Enum result code
+						if texRetA then
+							warn("[Meshy AI] D: Enum result = " .. tostring(texRetA))
+						end
 					end
 
 					if textureAssetId then
-						print("[Meshy AI] Texture published — rbxassetid://" .. tostring(textureAssetId))
+						print("[Meshy AI] D: Texture published — rbxassetid://" .. tostring(textureAssetId))
 					else
-						warn("[Meshy AI] Texture publish returned no asset ID: " .. tostring(texRetA) .. ", " .. tostring(texRetB))
+						warn("[Meshy AI] D: textureAssetId is nil after extraction — TextureID will NOT be set on MeshPart")
 					end
 				else
-					warn("[Meshy AI] Texture publish error: " .. tostring(texRetA))
-					warn("[Meshy AI] Continuing with mesh only")
+					warn("[Meshy AI] D: CreateAssetAsync threw an error: " .. tostring(texRetA))
+					warn("[Meshy AI] D: Continuing with mesh only — NO TEXTURE")
 				end
+			else
+				print("[Meshy AI] D: editableImage is nil — skipping texture publish entirely")
 			end
+			print("[Meshy AI] D: Final textureAssetId = " .. tostring(textureAssetId))
 
 			------------------------------------------------------------
 			-- E. Create new MeshPart from permanent mesh asset
@@ -2682,13 +3330,22 @@ ui.callbacks.onPublish = function()
 			local permanentMeshUri = Content.fromUri("rbxassetid://" .. tostring(meshAssetId))
 			local meshPart = AssetService:CreateMeshPartAsync(permanentMeshUri)
 
+			print("[Meshy AI] --- Section E: MeshPart Assembly ---")
 			meshPart.Name = "MeshyAsset"
 			meshPart.Anchored = true
 
 			-- Apply texture if we published one
 			if textureAssetId then
-				meshPart.TextureID = "rbxassetid://" .. tostring(textureAssetId)
+				local textureIdStr = "rbxassetid://" .. tostring(textureAssetId)
+				meshPart.TextureID = textureIdStr
+				print("[Meshy AI] E: Set TextureID = " .. textureIdStr)
+				print("[Meshy AI] E: Verify TextureID on part = " .. tostring(meshPart.TextureID))
+			else
+				warn("[Meshy AI] E: textureAssetId is nil — MeshPart published WITHOUT texture")
+				warn("[Meshy AI] E: This means the texture will NOT appear after the experience is published")
 			end
+			print("[Meshy AI] E: Final MeshId = " .. tostring(meshPart.MeshId))
+			print("[Meshy AI] E: Final TextureID = " .. tostring(meshPart.TextureID))
 
 			-- Position in front of camera
 			local camera = workspace.CurrentCamera
@@ -2706,6 +3363,7 @@ ui.callbacks.onPublish = function()
 				state.previewMeshPart:Destroy()
 			end
 			state.previewMeshPart = nil
+			state.previewEditableImage = nil
 
 			ui:setPubProgress(100)
 			local statusMsg = "Published! Mesh ID: " .. tostring(meshAssetId)
@@ -2743,6 +3401,94 @@ ui.callbacks.onPublish = function()
 		setBusy(false)
 	end)
 end
+
+------------------------------------------------------------------------
+-- History Callbacks
+------------------------------------------------------------------------
+
+-- Load a history entry: restore state, preview mesh, switch to Create tab
+ui.callbacks.onLoadHistory = function(entry)
+	if state.busy then
+		warn("[Meshy AI] Cannot load history entry while busy")
+		return
+	end
+
+	if not entry.modelUrls or not entry.modelUrls.obj then
+		warn("[Meshy AI] History entry has no OBJ URL — cannot load")
+		return
+	end
+
+	setBusy(true)
+	ui:showGenProgress()
+	ui:setGenProgress(0)
+	ui:setGenStatus("Loading from history...")
+
+	-- Restore state
+	state.currentTaskId = entry.taskId
+	state.currentTaskType = entry.taskType
+	state.sourceType = entry.sourceType
+	state.originalPreviewTaskId = entry.originalPreviewTaskId
+	state.modelUrls = entry.modelUrls
+	state.textureUrls = entry.textureUrls
+	state.thumbnailUrl = entry.thumbnailUrl
+
+
+	task.spawn(function()
+		local ok, err = pcall(function()
+			ui:setGenProgress(50)
+			ui:setGenStatus("Importing mesh from history...")
+
+			local previewOk, previewErr = pcall(importPreview, entry.modelUrls)
+			if previewOk and state.previewEditableMesh then
+				ui:setGenProgress(100)
+				ui:setGenStatus("Loaded from history!", Color3.fromRGB(76, 175, 80))
+			else
+				ui:setGenProgress(100)
+				ui:setGenStatus("Loaded (preview failed - check Output)", Color3.fromRGB(255, 152, 0))
+				if not previewOk then
+					warn("[Meshy AI] History load preview error: " .. tostring(previewErr))
+				end
+			end
+
+			ui:setThumbnail(entry.thumbnailUrl or "")
+			ui:enableStep(2)
+			ui:enableStep(3)
+			ui:enablePublish()
+		end)
+
+		if not ok then
+			ui:setGenProgress(0)
+			ui:setGenStatus("Load failed: " .. tostring(err), Color3.fromRGB(244, 67, 54))
+		end
+
+		setBusy(false)
+	end)
+end
+
+-- Delete a single history entry by taskId
+ui.callbacks.onDeleteHistory = function(entry)
+	for i, e in ipairs(history) do
+		if e.taskId == entry.taskId and e.timestamp == entry.timestamp then
+			table.remove(history, i)
+			break
+		end
+	end
+	saveHistory()
+	ui:refreshHistory(history)
+end
+
+-- Clear all history
+ui.callbacks.onClearHistory = function()
+	history = {}
+	saveHistory()
+	ui:refreshHistory(history)
+end
+
+------------------------------------------------------------------------
+-- Startup: load history
+------------------------------------------------------------------------
+loadHistory()
+ui:refreshHistory(history)
 
 ------------------------------------------------------------------------
 -- Toggle widget visibility
